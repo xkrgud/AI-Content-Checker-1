@@ -7,8 +7,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import multer from 'multer';
-import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { GoogleGenAI, MediaResolution, ThinkingLevel, Type } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
+import { GEMINI_MODELS } from './src/config/geminiModels.ts';
 import {
   isPrivateOrReservedHostname,
   validateAndNormalizeUrl,
@@ -32,13 +33,20 @@ import {
   validateVideoFileMeta,
 } from './src/utils/videoUpload.ts';
 import {
+  applyFactCheckVerdictsToSummaries,
   buildFactCheckReport,
   buildTodayDateInstruction,
   parseMultiClaimFactCheckResponse,
   sanitizeInitialAnalysisText,
   selectClaimsForFactCheck,
 } from './src/utils/factCheck.ts';
-import { classifyAnalyzeError, isAbortLikeError } from './src/utils/errorClassifier.ts';
+import {
+  classifyAnalyzeError,
+  extractErrorStatus,
+  isAbortLikeError,
+  isQuotaExhaustedError,
+  QUOTA_EXHAUSTED_USER_MESSAGE,
+} from './src/utils/errorClassifier.ts';
 import { createAnalyzeRateLimiter, normalizeClientIp } from './src/utils/rateLimiter.ts';
 import type {
   AiGenerationAssessment,
@@ -605,6 +613,76 @@ const analysisResponseSchema = {
       items: { type: Type.STRING },
       description: '직접 해볼 수 있는 간단한 확인 방법 3~4가지 (쉬운 말로)',
     },
+    aiDetection: {
+      type: Type.OBJECT,
+      description:
+        '영상 입력이 있을 때 화면·소리·메타데이터에서 관찰된 AI 생성·합성 단서 및 실제 촬영 단서 점검 결과. 텍스트·이미지 단독 입력이면 빈 배열과 짧은 안내 문구 반환.',
+      properties: {
+        aiLogos: {
+          type: Type.ARRAY,
+          description:
+            '화면 구석이나 영상 안에 보이는 AI 생성 도구 로고 또는 워터마크 목록(예: Sora, Veo, Kling, Runway, Luma, Hailuo 등). 없으면 빈 배열.',
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              toolName: { type: Type.STRING, description: '도구 이름(예: Sora, Veo, Runway)' },
+              timestamp: { type: Type.STRING, description: '보인 시점(반드시 분:초 형식, 예: 0:02)' },
+              description: { type: Type.STRING, description: '로고가 어디에 어떻게 보였는지 쉬운 설명' },
+            },
+            required: ['toolName', 'timestamp', 'description'],
+          },
+        },
+        visualAndAudioClues: {
+          type: Type.ARRAY,
+          description:
+            '손가락·치아·눈 이상, 깨진 글자, 얼굴/머리카락 경계 번짐, 물체 변화, 부자연스러운 움직임, 입모양-소리 불일치, 단조로운 TTS 음성 중 실제로 관찰한 단서만 시점(분:초)과 함께 기록. 로고는 제외.',
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              category: {
+                type: Type.STRING,
+                description:
+                  '다음 중 가장 가까운 항목: "손가락·치아·눈 모양 이상", "깨지거나 뜻 없는 글자", "얼굴·머리카락 경계 번짐", "물체가 갑자기 변하거나 사라짐", "부자연스러운 움직임", "입 모양과 소리 불일치", "단조로운 합성 음성", "기타 화면·소리 이상"',
+              },
+              timestamp: {
+                type: Type.STRING,
+                description: '단서가 나타난 영상 속 정확한 시점(반드시 분:초 형식, 예: 0:04)',
+              },
+              description: {
+                type: Type.STRING,
+                description: '무엇이 어떻게 어색했는지 중학생도 알 수 있게 구체적으로 설명',
+              },
+            },
+            required: ['category', 'timestamp', 'description'],
+          },
+        },
+        realFootageClues: {
+          type: Type.ARRAY,
+          description:
+            '실제로 카메라로 촬영한 영상이라는 단서(자연스러운 손 떨림, 일관된 배경·그림자, 실제 장소·간판·사람 반응 등). 없으면 빈 배열.',
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              timestamp: {
+                type: Type.STRING,
+                description: '해당 모습이 보이는 시점(분:초 형식, 예: 0:03). 영상 전체 특징이면 "전체"',
+              },
+              description: {
+                type: Type.STRING,
+                description: '실제 촬영 영상처럼 보이는 구체적인 이유(쉬운 말로)',
+              },
+            },
+            required: ['timestamp', 'description'],
+          },
+        },
+        summaryNote: {
+          type: Type.STRING,
+          description:
+            'AI 생성·합성 단서를 종합한 1~2문장의 쉬운 참고 메모. 절대 "100% AI 영상이다"라고 단정하지 마세요.',
+        },
+      },
+      required: ['aiLogos', 'visualAndAudioClues', 'realFootageClues', 'summaryNote'],
+    },
   },
   required: [
     'videoAccessible',
@@ -620,81 +698,8 @@ const analysisResponseSchema = {
     'aiGenerationAssessment',
     'checklistEvaluations',
     'additionalVerificationSteps',
+    'aiDetection',
   ],
-};
-
-const aiDetectionResponseSchema = {
-  type: Type.OBJECT,
-  properties: {
-    videoAnalyzed: {
-      type: Type.BOOLEAN,
-      description:
-        '영상을 실제로 보고 프레임과 소리를 점검했으면 true, 영상을 불러오지 못했으면 false.',
-    },
-    aiLogos: {
-      type: Type.ARRAY,
-      description:
-        '화면 구석이나 영상 안에 보이는 AI 생성 도구 로고 또는 워터마크 목록(예: Sora, Veo, Kling, Runway, Luma, Hailuo 등). 없으면 빈 배열.',
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          toolName: { type: Type.STRING, description: '도구 이름(예: Sora, Veo, Runway)' },
-          timestamp: { type: Type.STRING, description: '보인 시점(반드시 분:초 형식, 예: 0:02)' },
-          description: { type: Type.STRING, description: '로고가 어디에 어떻게 보였는지 쉬운 설명' },
-        },
-        required: ['toolName', 'timestamp', 'description'],
-      },
-    },
-    visualAndAudioClues: {
-      type: Type.ARRAY,
-      description:
-        '아래 8가지 AI 생성·합성 단서를 하나씩 점검해 실제로 발견한 것만 적으세요. 발견한 단서마다 영상 속 정확한 시점(분:초)과 구체적 설명을 반드시 포함해야 합니다. 로고 항목은 aiLogos에 적고 여기에 중복하지 마세요.',
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          category: {
-            type: Type.STRING,
-            description:
-              '다음 중 가장 가까운 항목: "손가락·치아·눈 모양 이상", "깨지거나 뜻 없는 글자", "얼굴·머리카락 경계 번짐", "물체가 갑자기 변하거나 사라짐", "부자연스러운 움직임", "입 모양과 소리 불일치", "단조로운 합성 음성", "기타 화면·소리 이상"',
-          },
-          timestamp: {
-            type: Type.STRING,
-            description: '단서가 나타난 영상 속 정확한 시점(반드시 분:초 형식, 예: 0:04)',
-          },
-          description: {
-            type: Type.STRING,
-            description: '무엇이 어떻게 어색했는지 중학생도 알 수 있게 구체적으로 설명',
-          },
-        },
-        required: ['category', 'timestamp', 'description'],
-      },
-    },
-    realFootageClues: {
-      type: Type.ARRAY,
-      description:
-        '실제로 카메라로 촬영한 영상이라는 단서(자연스러운 손 떨림, 일관된 배경·그림자, 실제 장소·간판·사람 반응 등). 없으면 빈 배열.',
-      items: {
-        type: Type.OBJECT,
-        properties: {
-          timestamp: {
-            type: Type.STRING,
-            description: '해당 모습이 보이는 시점(분:초 형식, 예: 0:03). 영상 전체 특징이면 "전체"',
-          },
-          description: {
-            type: Type.STRING,
-            description: '실제 촬영 영상처럼 보이는 구체적인 이유(쉬운 말로)',
-          },
-        },
-        required: ['timestamp', 'description'],
-      },
-    },
-    summaryNote: {
-      type: Type.STRING,
-      description:
-        '단서를 종합한 1~2문장의 쉬운 참고 메모. 절대 "100% AI 영상이다"라고 단정하지 마세요.',
-    },
-  },
-  required: ['videoAnalyzed', 'aiLogos', 'visualAndAudioClues', 'realFootageClues', 'summaryNote'],
 };
 
 function sanitizeChecklistVerdict(raw?: string): ChecklistVerdict {
@@ -735,7 +740,7 @@ async function generateWithRetry<T>(
       return await fn();
     } catch (error) {
       lastError = error;
-      if (signal?.aborted || isAbortLikeError(error)) {
+      if (signal?.aborted || isAbortLikeError(error) || isQuotaExhaustedError(error)) {
         throw error;
       }
       const msg = error instanceof Error ? error.message : String(error);
@@ -1141,16 +1146,7 @@ async function startServer() {
       const resolvedDurationSeconds =
         ytData?.durationSeconds ?? clientDurationSeconds ?? clientCompressionSummary?.durationSeconds ?? null;
 
-      const clientIsShortVideo =
-        req.body?.isShortVideo === true || req.body?.isShortVideo === 'true';
-      const isShortVideo = Boolean(
-        clientIsShortVideo ||
-          urlIsShortVideo ||
-          platform === 'instagram' ||
-          (!normalizedUrl && uploadedFile) ||
-          (resolvedDurationSeconds != null && resolvedDurationSeconds <= 90)
-      );
-      const sampledFps = isShortVideo ? 4 : 1;
+      const sampledFps = 1;
 
       emitStreamEvent({
         type: 'meta',
@@ -1244,12 +1240,16 @@ async function startServer() {
       const parts: GeminiPart[] = [];
 
       if (uploadedVideoPart) {
-        parts.push(uploadedVideoPart);
+        parts.push({
+          ...uploadedVideoPart,
+          videoMetadata: { fps: sampledFps },
+        });
       } else if (isYouTubeVideo && normalizedUrl) {
         parts.push({
           fileData: {
             fileUri: normalizedUrl,
           },
+          videoMetadata: { fps: sampledFps },
         });
       }
 
@@ -1301,6 +1301,7 @@ async function startServer() {
           '1) whatVideoIsAbout에 이 영상이 어떤 영상인지 쉬운 말로 설명하고, threeLineSummary(무슨 영상인지 / 주의할 점 / 이렇게 확인해 보세요)를 채워 주세요.',
           '2) 핵심 주장과 수치, 과장·오해 유발 표현, 출처 제시 여부, AI 생성/합성 가능성을 쉬운 일상 언어로 분석하세요.',
           `3) 아래 신뢰성 체크리스트 5개 항목을 직접 점검하고 각 항목에 대해 "예", "아니오", "확인 필요" 중 하나와 쉬운 이유(aiReason)를 checklistEvaluations에 모두 채워 주세요:\n${checklistPromptSection}`,
+          '4) 동시에 aiDetection 항목도 함께 점검하세요: 화면의 AI 도구 로고/워터마크(aiLogos), 손가락·글자·움직임·입모양·TTS 음성 이상 단서(visualAndAudioClues, 반드시 분:초 시점 포함), 실제 촬영 단서(realFootageClues)를 실제 관찰한 내용만 적고 단서가 없으면 빈 배열로 두세요.',
           linkContextLines,
         ]
           .filter(Boolean)
@@ -1313,6 +1314,7 @@ async function startServer() {
           '1) whatVideoIsAbout에 이 영상이 어떤 영상인지 쉬운 말로 설명하고, threeLineSummary(무슨 영상인지 / 주의할 점 / 이렇게 확인해 보세요)를 채워 주세요.',
           '2) 핵심 주장과 수치, 과장·오해 유발 표현, 출처 제시 여부, AI 생성/합성 가능성을 쉬운 일상 언어로 분석하세요.',
           `3) 아래 신뢰성 체크리스트 5개 항목을 직접 점검하고 각 항목에 대해 "예", "아니오", "확인 필요" 중 하나와 쉬운 이유(aiReason)를 checklistEvaluations에 모두 채워 주세요:\n${checklistPromptSection}`,
+          '4) 동시에 aiDetection 항목도 함께 점검하세요: 화면의 AI 도구 로고/워터마크(aiLogos), 손가락·글자·움직임·입모양·TTS 음성 이상 단서(visualAndAudioClues, 반드시 분:초 시점 포함), 실제 촬영 단서(realFootageClues)를 실제 관찰한 내용만 적고 단서가 없으면 빈 배열로 두세요.',
           transcriptOrNotes ? `\n[사용자가 추가로 적은 메모]\n${transcriptOrNotes}` : '',
         ]
           .filter(Boolean)
@@ -1327,6 +1329,7 @@ async function startServer() {
         promptText = [
           '첨부된 이미지를 중학생도 이해하기 쉬운 말로 분석해 주세요. whatVideoIsAbout에는 어떤 이미지인지 설명하고, threeLineSummary(무슨 콘텐츠인지 / 주의할 점 / 이렇게 확인해 보세요)와 이미지 속 글자(extractedImageText)를 정리하세요.',
           `또한 아래 신뢰성 체크리스트 5개 항목을 직접 점검하여 checklistEvaluations에 판정("예", "아니오", "확인 필요")과 쉬운 이유를 모두 채워 주세요:\n${checklistPromptSection}`,
+          '이미지 입력이므로 aiDetection의 aiLogos/visualAndAudioClues/realFootageClues는 빈 배열([])로 두고 summaryNote에만 간단한 안내를 적으세요.',
           contextText,
         ]
           .filter(Boolean)
@@ -1342,6 +1345,7 @@ async function startServer() {
         promptText = [
           '다음 콘텐츠를 중학생도 이해하기 쉬운 말로 분석해 주세요. whatVideoIsAbout에는 어떤 내용의 글인지 설명하고, threeLineSummary(무슨 콘텐츠인지 / 주의할 점 / 이렇게 확인해 보세요)를 채워 주세요.',
           `또한 아래 신뢰성 체크리스트 5개 항목을 직접 점검하여 checklistEvaluations에 판정("예", "아니오", "확인 필요")과 쉬운 이유를 모두 채워 주세요:\n${checklistPromptSection}`,
+          '텍스트 입력이므로 aiDetection의 aiLogos/visualAndAudioClues/realFootageClues는 빈 배열([])로 두고 summaryNote에만 간단한 안내를 적으세요.',
           contextText,
         ].join('\n\n');
       }
@@ -1364,30 +1368,68 @@ async function startServer() {
 5. 신뢰성 체크리스트 5개 항목(id 포함)은 당신(AI)이 직접 점검해 각각 "예", "아니오", "확인 필요" 중 하나와 쉬운 이유를 적어 주세요.
 6. coreClaims의 각 주장은 반드시 사실 주장("fact": 수치, 사건, 제품 사양, 발표처럼 객관적 확인이 가능한 것)과 의견 주장("opinion": 사용 후기, 평가, 느낌, 추천)으로 나누어 claimType에 기록하세요.
 7. 1차 분석(내용 분석)에서는 주장이 사실인지 아닌지 절대 판단하지 말고 주장만 정리하세요. "잘못된 정보", "사실이 아님", "거짓 정보", "허위 사실", "무조건 거짓", "100% 사실" 같은 표현은 절대 쓰지 마세요.
-8. 사실 확인은 이 단계 뒤의 별도 Google 검색 단계에서만 진행합니다. 이 1차 분석에서는 주장과 근거 구조를 정리하고, 사용자가 추가로 확인해 볼 공식 자료와 검색어를 안내해 주세요.`;
+8. 사실 확인은 이 단계 뒤의 별도 Google 검색 단계에서만 진행합니다. 이 1차 분석에서는 주장과 근거 구조를 정리하고, 사용자가 추가로 확인해 볼 공식 자료와 검색어를 안내해 주세요.
+9. 영상 입력이 있을 때는 aiDetection에 화면·소리에서 실제로 관찰한 AI 생성·합성 단서와 실제 촬영 단서만 시점(분:초)과 함께 적고, 단서가 없으면 빈 배열로 두며, 절대 "100% AI 영상이다"라고 단정 짓지 마세요.`;
 
       const buildMainPartsWithCurrentVideo = (): GeminiPart[] => {
         if (!uploadedVideoPart) return parts;
-        return [uploadedVideoPart, ...parts.slice(1)];
+        return [
+          { ...uploadedVideoPart, videoMetadata: { fps: sampledFps } },
+          ...parts.slice(1),
+        ];
       };
 
-      const runAnalysisCall = (modelName: string) =>
-        ai.models.generateContent({
-          model: modelName,
-          contents: { parts: buildMainPartsWithCurrentVideo() },
-          config: {
-            systemInstruction,
-            responseMimeType: 'application/json',
-            responseSchema: analysisResponseSchema,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            abortSignal: serverAbortController.signal,
-          },
-        });
+      const shouldApplyLowMediaResolution = Boolean(hasDirectVideoInput || imageDataUrl);
+
+      const invokeAnalysisCall = async (modelName: string) => {
+        const currentParts = buildMainPartsWithCurrentVideo();
+        try {
+          return await ai.models.generateContent({
+            model: modelName,
+            contents: { parts: currentParts },
+            config: {
+              systemInstruction,
+              responseMimeType: 'application/json',
+              responseSchema: analysisResponseSchema,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              ...(shouldApplyLowMediaResolution
+                ? { mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW }
+                : {}),
+              abortSignal: serverAbortController.signal,
+            },
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (
+            shouldApplyLowMediaResolution &&
+            /400|INVALID_ARGUMENT/i.test(msg) &&
+            /media_?resolution/i.test(msg)
+          ) {
+            console.warn(
+              `[api/analyze] ${modelName} rejected mediaResolution=LOW (${msg}); retrying without mediaResolution.`
+            );
+            return await ai.models.generateContent({
+              model: modelName,
+              contents: { parts: currentParts },
+              config: {
+                systemInstruction,
+                responseMimeType: 'application/json',
+                responseSchema: analysisResponseSchema,
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                abortSignal: serverAbortController.signal,
+              },
+            });
+          }
+          throw err;
+        }
+      };
+
+      let usedFallbackModel = false;
 
       const runMainAnalysisWithFallback = async () => {
         try {
           return await generateWithRetry(
-            () => runAnalysisCall('gemini-4-hydrogen'),
+            () => invokeAnalysisCall(GEMINI_MODELS.primaryAnalysis),
             1,
             serverAbortController.signal
           );
@@ -1396,24 +1438,42 @@ async function startServer() {
             throw primaryErr;
           }
           const primaryMsg = primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
+          const primaryStatus = extractErrorStatus(primaryErr);
+          console.error('[api/analyze] primary analysis model failed:', {
+            model: GEMINI_MODELS.primaryAnalysis,
+            status: primaryStatus ?? null,
+            message: primaryMsg,
+          });
+
           if (
             uploadedVideoPart &&
             'inlineData' in uploadedVideoPart &&
             /413|payload|entity too large|request size|too large/i.test(primaryMsg)
           ) {
             uploadedVideoPart = await uploadVideoViaFileApi();
-            return await runAnalysisCall('gemini-4-hydrogen');
+            return await invokeAnalysisCall(GEMINI_MODELS.primaryAnalysis);
           }
-          if (/503|UNAVAILABLE|high demand|429|RESOURCE_EXHAUSTED/i.test(primaryMsg)) {
+
+          if (
+            isQuotaExhaustedError(primaryErr) ||
+            /503|UNAVAILABLE|high demand/i.test(primaryMsg)
+          ) {
+            usedFallbackModel = true;
             try {
               return await generateWithRetry(
-                () => runAnalysisCall('gemini-3.1-flash-lite'),
+                () => invokeAnalysisCall(GEMINI_MODELS.fallbackAnalysis),
                 1,
                 serverAbortController.signal
               );
-            } catch {
-              // Preserve the primary 503/429 error instead of masking it with a fallback model error
-              throw primaryErr;
+            } catch (fallbackErr) {
+              const fallbackMsg =
+                fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+              console.error('[api/analyze] fallback analysis model failed:', {
+                model: GEMINI_MODELS.fallbackAnalysis,
+                status: extractErrorStatus(fallbackErr) ?? null,
+                message: fallbackMsg,
+              });
+              throw fallbackErr;
             }
           }
           throw primaryErr;
@@ -1421,7 +1481,6 @@ async function startServer() {
       };
 
       interface RawAiDetectionResult {
-        videoAnalyzed?: boolean;
         aiLogos?: Array<{ toolName?: string; timestamp?: string; description?: string }>;
         visualAndAudioClues?: Array<{
           category?: string;
@@ -1432,185 +1491,16 @@ async function startServer() {
         summaryNote?: string;
       }
 
-      const aiDetectionSystemInstruction = `${todayDateInstruction}
-
-당신은 AI 생성·합성 영상 단서 점검 전문가입니다.
-중학생도 이해하기 쉬운 한국어로 답하되, 추측으로 단서를 지어내지 마세요.
-반드시 실제로 눈으로 보고 귀로 들은 장면에 대해서만 정확한 시점(분:초, 예: 0:04)을 적으세요.
-단서가 없으면 억지로 만들지 말고 빈 배열([])을 반환하세요.
-그리고 어떤 경우에도 "100% AI 영상이다" 또는 "AI가 만든 게 확실하다"라고 단정 짓지 마세요.`;
-
-      const aiDetectionPrompt = [
-        `첨부된 영상을 초당 ${sampledFps}장(fps=${sampledFps}) 수준으로 꼼꼼히 살펴보고, 아래 8가지 AI 생성·합성 단서를 하나씩 확인하세요:`,
-        '1. 손가락·치아·눈 모양 이상 (손가락 개수 어색함, 치아가 뭉개짐, 동공 비대칭)',
-        '2. 깨지거나 뜻 없는 글자 (간판·자막·책·옷 글자가 뭉개지거나 알 수 없는 글자)',
-        '3. 얼굴·머리카락 경계 번짐 (머리카락 끝이나 얼굴 윤곽이 배경과 이상하게 섞임)',
-        '4. 물체가 갑자기 변하거나 사라짐 (손에 든 물건이나 배경 사물이 순간적으로 바뀜)',
-        '5. 부자연스러운 움직임 (관절이 꺾이거나, 물리 법칙에 어긋나거나, 미끄러지듯 움직임)',
-        '6. 입 모양과 소리 불일치 (말하는 입 모양과 들리는 말소리가 따로 놈)',
-        '7. 단조로운 합성 음성 (감정·억양 변화가 기계적으로 반복되는 TTS 같은 목소리)',
-        '8. 화면 속 AI 도구 로고 (Sora, Veo, Kling, Runway, Luma, Hailuo 등 로고·워터마크)',
-        '규칙:',
-        '- 1~7번에서 발견한 단서는 visualAndAudioClues에 넣되, 반드시 영상 속 시점(분:초)과 구체적 설명을 적으세요.',
-        '- 8번 로고/워터마크를 발견했다면 aiLogos에만 넣고, visualAndAudioClues에는 중복으로 넣지 마세요.',
-        '- 반대로 실제로 사람이 촬영한 영상이라는 단서(자연스러운 손 떨림, 일관된 배경과 그림자, 실제 장소·간판·사람 반응 등)도 함께 찾아 realFootageClues에 적어 주세요.',
-        '- 영상을 불러오지 못해 화면을 볼 수 없다면 videoAnalyzed를 false로 반환하세요.',
-      ].join('\n');
-
-      const detectionAbortController = new AbortController();
-      const onServerAbortForDetection = () => detectionAbortController.abort();
-      if (serverAbortController.signal.aborted) {
-        detectionAbortController.abort();
-      } else {
-        serverAbortController.signal.addEventListener('abort', onServerAbortForDetection, {
-          once: true,
-        });
-      }
-
-      const detectionVideoPartSnapshot = uploadedVideoPart ? { ...uploadedVideoPart } : null;
-
-      const invokeAiDetectionModel = async (
-        modelName: string,
-        useCodeExecution: boolean
-      ) => {
-        const videoPartForDetection: GeminiPart = detectionVideoPartSnapshot
-          ? {
-              ...detectionVideoPartSnapshot,
-              videoMetadata: { fps: sampledFps },
-            }
-          : {
-              fileData: { fileUri: normalizedUrl! },
-              videoMetadata: { fps: sampledFps },
-            };
-
-        const detectionParts: GeminiPart[] = [
-          videoPartForDetection,
-          { text: aiDetectionPrompt },
-        ];
-        return ai.models.generateContent({
-          model: modelName,
-          contents: { parts: detectionParts },
-          config: {
-            systemInstruction: aiDetectionSystemInstruction,
-            responseMimeType: 'application/json',
-            responseSchema: aiDetectionResponseSchema,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH },
-            ...(useCodeExecution ? { tools: [{ codeExecution: {} }] } : {}),
-            abortSignal: detectionAbortController.signal,
-          },
-        });
-      };
-
-      const runSeparateAiDetection = async (): Promise<{
-        succeeded: boolean;
-        agenticVideoEnabled: boolean;
-        raw: RawAiDetectionResult | null;
-      }> => {
-        if (!hasDirectVideoInput) {
-          return { succeeded: false, agenticVideoEnabled: false, raw: null };
-        }
-
-        const tryModel = async (
-          modelName: string
-        ): Promise<{ text: string; agenticVideoEnabled: boolean }> => {
-          try {
-            const resWithTool = await invokeAiDetectionModel(modelName, true);
-            return { text: resWithTool.text?.trim() || '', agenticVideoEnabled: true };
-          } catch (toolErr) {
-            if (detectionAbortController.signal.aborted || isAbortLikeError(toolErr)) {
-              throw toolErr;
-            }
-            const msg = toolErr instanceof Error ? toolErr.message : String(toolErr);
-            // Retry without codeExecution if model/endpoint rejects tools + responseSchema (HTTP 400 / INVALID_ARGUMENT)
-            if (/400|INVALID_ARGUMENT|code_execution|codeExecution|tool|schema/i.test(msg)) {
-              const resPlain = await invokeAiDetectionModel(modelName, false);
-              return { text: resPlain.text?.trim() || '', agenticVideoEnabled: false };
-            }
-            throw toolErr;
-          }
-        };
-
-        try {
-          let result: { text: string; agenticVideoEnabled: boolean };
-          try {
-            result = await generateWithRetry(
-              () => tryModel('gemini-4-hydrogen'),
-              1,
-              detectionAbortController.signal
-            );
-          } catch (primaryErr) {
-            if (detectionAbortController.signal.aborted || isAbortLikeError(primaryErr)) {
-              throw primaryErr;
-            }
-            const primaryMsg =
-              primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
-            if (/503|UNAVAILABLE|high demand|429|RESOURCE_EXHAUSTED/i.test(primaryMsg)) {
-              result = await generateWithRetry(
-                () => tryModel('gemini-3.1-flash-lite'),
-                1,
-                detectionAbortController.signal
-              );
-            } else {
-              throw primaryErr;
-            }
-          }
-
-          if (!result.text) {
-            return {
-              succeeded: false,
-              agenticVideoEnabled: result.agenticVideoEnabled,
-              raw: null,
-            };
-          }
-          const parsedAi = JSON.parse(result.text) as RawAiDetectionResult;
-          if (parsedAi.videoAnalyzed === false) {
-            return {
-              succeeded: false,
-              agenticVideoEnabled: result.agenticVideoEnabled,
-              raw: parsedAi,
-            };
-          }
-          return {
-            succeeded: true,
-            agenticVideoEnabled: result.agenticVideoEnabled,
-            raw: parsedAi,
-          };
-        } catch (err) {
-          if (detectionAbortController.signal.aborted || isAbortLikeError(err)) {
-            throw err;
-          }
-          // Soft-degrade AI detection call to '판별 불가' if main analysis succeeds
-          return { succeeded: false, agenticVideoEnabled: false, raw: null };
-        }
-      };
-
-      // Run Call A (content analysis) and Call B (AI detection) concurrently when direct video is present
+      // Single combined Call 1 (content analysis + AI generation clues)
       emitStageProgress('analyzing_content');
-      const mainAnalysisPromise = runMainAnalysisWithFallback();
-      const aiDetectionPromise = hasDirectVideoInput
-        ? runSeparateAiDetection()
-        : Promise.resolve({ succeeded: false, agenticVideoEnabled: false, raw: null });
-      aiDetectionPromise.catch(() => undefined);
-
-      let response;
-      try {
-        response = await mainAnalysisPromise;
-      } catch (mainErr) {
-        detectionAbortController.abort();
-        serverAbortController.signal.removeEventListener('abort', onServerAbortForDetection);
-        throw mainErr;
-      }
+      const response = await runMainAnalysisWithFallback();
 
       if (serverAbortController.signal.aborted || res.writableEnded) {
-        detectionAbortController.abort();
-        serverAbortController.signal.removeEventListener('abort', onServerAbortForDetection);
         return;
       }
 
       const rawText = response.text?.trim();
       if (!rawText) {
-        detectionAbortController.abort();
-        serverAbortController.signal.removeEventListener('abort', onServerAbortForDetection);
         if (hasDirectVideoInput) {
           return sendErrorResponse(
             422,
@@ -1639,20 +1529,12 @@ async function startServer() {
           aiReason?: string;
         }>;
         additionalVerificationSteps?: string[];
+        aiDetection?: RawAiDetectionResult;
       };
 
-      try {
-        parsed = JSON.parse(rawText);
-      } catch (parseErr) {
-        detectionAbortController.abort();
-        serverAbortController.signal.removeEventListener('abort', onServerAbortForDetection);
-        throw parseErr;
-      }
+      parsed = JSON.parse(rawText);
 
       if (hasDirectVideoInput && parsed.videoAccessible === false) {
-        // Call A reports video could not be loaded -> abort & discard Call B completely
-        detectionAbortController.abort();
-        serverAbortController.signal.removeEventListener('abort', onServerAbortForDetection);
         return sendErrorResponse(
           422,
           isYouTubeVideo
@@ -1660,13 +1542,6 @@ async function startServer() {
             : '영상을 불러올 수 없어요. 업로드한 영상 파일이 손상되지 않았는지 확인해 주세요.'
         );
       }
-
-      if (hasDirectVideoInput) {
-        emitStageProgress('detecting_ai');
-      }
-      const aiDetectionOutcome = await aiDetectionPromise.finally(() => {
-        serverAbortController.signal.removeEventListener('abort', onServerAbortForDetection);
-      });
 
       if (serverAbortController.signal.aborted || res.writableEnded) {
         return;
@@ -1769,8 +1644,8 @@ async function startServer() {
         });
       });
 
-      // Build Stage 3 AI suspicion clues & deterministic score
-      const rawDetection = aiDetectionOutcome.raw;
+      // Build AI suspicion clues & deterministic score from combined Call 1 response
+      const rawDetection = hasDirectVideoInput ? parsed.aiDetection ?? null : null;
       const aiLogos: AiLogoClue[] = Array.isArray(rawDetection?.aiLogos)
         ? rawDetection.aiLogos
             .filter((logo) => Boolean(logo?.toolName?.trim() || logo?.description?.trim()))
@@ -1813,7 +1688,7 @@ async function startServer() {
         extraText: transcriptOrNotes,
       });
 
-      const detectionAvailable = Boolean(hasDirectVideoInput && aiDetectionOutcome.succeeded);
+      const detectionAvailable = Boolean(hasDirectVideoInput);
       const suspicionBreakdown = calculateAiSuspicionScore({
         available: detectionAvailable,
         aiLogos,
@@ -1840,9 +1715,7 @@ async function startServer() {
               : `영상과 정보에서 총 ${suspicionBreakdown.totalCluesDetected}개의 AI 관련 단서가 관찰되었어요. 단서의 양일 뿐 AI 영상이라는 확정 판정은 아니에요.`
             : '이 링크는 영상 프레임을 직접 불러올 수 없어 AI 생성 의심도 화면·소리 점검을 건너뛰었어요.'),
         sampledFps: hasDirectVideoInput ? sampledFps : undefined,
-        agenticVideoEnabled: hasDirectVideoInput
-          ? aiDetectionOutcome.agenticVideoEnabled
-          : undefined,
+        agenticVideoEnabled: false,
       };
 
       // Calculate reliability score deterministically by code rules (100-point max)
@@ -1951,9 +1824,9 @@ async function startServer() {
           .filter(Boolean)
           .join('\n\n');
 
-        const callSearchModel = (modelName: string) =>
-          ai.models.generateContent({
-            model: modelName,
+        try {
+          const searchResponse = await ai.models.generateContent({
+            model: GEMINI_MODELS.factCheck,
             contents: factPrompt,
             config: {
               systemInstruction: `${todayDateInstruction}\n\n당신은 Google 검색 최신 자료를 바탕으로 주장을 대조·판정하는 팩트체크 도우미입니다. 검색 시 제품명·사건명과 올해 연도(${currentYear}년)를 포함해 최신 자료를 우선 찾고, 근거가 없으면 반드시 "확인 불가"로 표시하세요. 중학생도 이해하기 쉬운 한국어 한 문장으로 이유를 적으세요.`,
@@ -1962,32 +1835,6 @@ async function startServer() {
               abortSignal: serverAbortController.signal,
             },
           });
-
-        try {
-          let searchResponse;
-          try {
-            searchResponse = await generateWithRetry(
-              () => callSearchModel('gemini-4-hydrogen'),
-              1,
-              serverAbortController.signal
-            );
-          } catch (primaryErr) {
-            if (serverAbortController.signal.aborted || isAbortLikeError(primaryErr)) {
-              throw primaryErr;
-            }
-            const primaryMsg =
-              primaryErr instanceof Error ? primaryErr.message : String(primaryErr);
-            if (/503|UNAVAILABLE|high demand|429|RESOURCE_EXHAUSTED/i.test(primaryMsg)) {
-              await new Promise((resolve) => setTimeout(resolve, 1500));
-              searchResponse = await generateWithRetry(
-                () => callSearchModel('gemini-3.1-flash-lite'),
-                1,
-                serverAbortController.signal
-              );
-            } else {
-              throw primaryErr;
-            }
-          }
 
           const responseText = searchResponse.text?.trim();
           if (!responseText) {
@@ -2009,13 +1856,21 @@ async function startServer() {
           if (serverAbortController.signal.aborted || isAbortLikeError(err)) {
             throw err;
           }
+          const errStatus = extractErrorStatus(err);
+          const errMessage = err instanceof Error ? err.message : String(err);
+          console.error('[api/analyze] fact-check model failed:', {
+            model: GEMINI_MODELS.factCheck,
+            status: errStatus ?? null,
+            message: errMessage,
+          });
+          const quotaHit = isQuotaExhaustedError(err);
           return claims.map((claimItem) => ({
             claimId: claimItem.id,
             claim: claimItem.claim,
             claimType: claimItem.claimType === 'opinion' ? 'opinion' : 'fact',
             status: 'search_error',
             verdict: '확인 불가',
-            summary: '검색 중 오류가 났어요',
+            summary: quotaHit ? QUOTA_EXHAUSTED_USER_MESSAGE : '검색 중 오류가 났어요',
             sources: [],
             searchQueries: [],
           }));
@@ -2033,137 +1888,16 @@ async function startServer() {
         return;
       }
 
-      emitStageProgress('summarizing');
-
-      // Call D: Rewrite overallSummary ('전체 설명') and all 3 lines of threeLineSummary
-      // reflecting the Google Search fact-check verdicts and latest search findings.
-      let reorganizedByLatestSearch = false;
-      const hasAnyNonErrorSearch =
-        checkedClaimResults.length > 0 &&
-        (factCheck.searchErrorCount ?? 0) < checkedClaimResults.length;
-
-      if (hasAnyNonErrorSearch) {
-        const synthesisSchema = {
-          type: Type.OBJECT,
-          properties: {
-            overallSummary: {
-              type: Type.STRING,
-              description:
-                '검색 판정 결과를 반영해 중학생도 이해하기 쉽게 다시 쓴 전체 설명 (2~3문장).',
-            },
-            whatItIs: {
-              type: Type.STRING,
-              description:
-                '검색 결과를 반영한 3줄 요약 1번: 무슨 영상인지 (1~2문장, 쉬운 일상 말로).',
-            },
-            watchOutFor: {
-              type: Type.STRING,
-              description:
-                '검색 판정 결과(사실과 다름·확인 불가·오래된 자료·과장 표현 등)를 반영한 3줄 요약 2번: 주의할 점 (1~2문장).',
-            },
-            howToVerify: {
-              type: Type.STRING,
-              description:
-                '검색 결과를 반영한 3줄 요약 3번: 이렇게 확인해 보세요 (1~2문장).',
-            },
-            differsFromInitialAnalysis: {
-              type: Type.BOOLEAN,
-              description:
-                '검색된 최신 자료 내용이 1차 분석의 내용·전제·인물/제품/사건 현황과 다르거나 검색 판정 결과를 반영해 수정·정리되었으면 true, 1차 분석과 같으면 false.',
-            },
-          },
-          required: [
-            'overallSummary',
-            'whatItIs',
-            'watchOutFor',
-            'howToVerify',
-            'differsFromInitialAnalysis',
-          ],
-        };
-
-        const searchFactsBlock = checkedClaimResults
-          .map((item, idx) => {
-            const typeText = item.claimType === 'opinion' ? '의견 주장' : '사실 주장';
-            const sourceList =
-              item.sources.length > 0
-                ? `\n   출처: ${item.sources
-                    .map(
-                      (s) =>
-                        `${s.title} (${s.publishedDate || '날짜 미상'}${
-                          s.isOutdated ? ', 오래된 자료' : ''
-                        })`
-                    )
-                    .join(', ')}`
-                : '';
-            return `${idx + 1}. [${typeText}] 주장: ${item.claim}\n   판정: ${
-              item.verdict || '확인 불가'
-            }\n   이유/상태: ${item.summary}${sourceList}`;
-          })
-          .join('\n');
-
-        const synthesisPrompt = [
-          '아래 1차 내용 분석 결과와 방금 Google 검색으로 확인한 사실 확인 판정을 통합해, "전체 설명(overallSummary)"과 3줄 요약(whatItIs, watchOutFor, howToVerify)을 검색 결과를 반영해 다시 써 주세요.',
-          `[코드로 정해진 종합 판정]\n${factCheck.overallVerdict}`,
-          `[1차 분석 전체 설명]\n${finalOverallSummary || '(없음)'}`,
-          `[1차 분석 3줄 요약]\n1. 무슨 영상인지: ${threeLineSummary.whatItIs}\n2. 주의할 점: ${threeLineSummary.watchOutFor}\n3. 이렇게 확인해 보세요: ${threeLineSummary.howToVerify}`,
-          `[Google 검색 사실 확인 결과]\n${searchFactsBlock}`,
-          '규칙:',
-          '1. 검색 자료와 1차 분석의 시점 가정이나 내용이 다르면 반드시 검색 자료를 우선해 다시 작성하고 differsFromInitialAnalysis를 true로 설정하세요.',
-          '2. "사실과 다름"으로 판정된 주장이 있으면 전체 설명과 2줄 요약(주의할 점)에 어떤 부분이 검색 자료와 달랐는지 중학생도 이해하기 쉽게 꼭 적으세요.',
-          '3. 출처가 "오래된 자료"이거나 "확인 불가"인 항목이 있으면 그 점도 주의할 점·확인 방법에 반영하세요.',
-        ].join('\n\n');
-
-        try {
-          const synthesisRes = await generateWithRetry(
-            () =>
-              ai.models.generateContent({
-                model: 'gemini-4-hydrogen',
-                contents: synthesisPrompt,
-                config: {
-                  systemInstruction: `${todayDateInstruction}\n\n당신은 1차 콘텐츠 구조 분석과 Google 검색 팩트체크 판정 결과를 통합해 전체 설명과 3줄 요약을 정리하는 도우미입니다. 최신 검색 자료가 1차 분석 내용과 다르면 항상 검색 자료를 우선합니다.`,
-                  responseMimeType: 'application/json',
-                  responseSchema: synthesisSchema,
-                  thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-                  abortSignal: serverAbortController.signal,
-                },
-              }),
-            1,
-            serverAbortController.signal
-          );
-          const synthesisText = synthesisRes.text?.trim();
-          if (synthesisText) {
-            const synthesisParsed = JSON.parse(synthesisText) as {
-              overallSummary?: string;
-              whatItIs?: string;
-              watchOutFor?: string;
-              howToVerify?: string;
-              differsFromInitialAnalysis?: boolean;
-            };
-            if (synthesisParsed.overallSummary?.trim()) {
-              finalOverallSummary = synthesisParsed.overallSummary.trim();
-            }
-            if (synthesisParsed.whatItIs?.trim()) {
-              threeLineSummary.whatItIs = synthesisParsed.whatItIs.trim();
-            }
-            if (synthesisParsed.watchOutFor?.trim()) {
-              threeLineSummary.watchOutFor = synthesisParsed.watchOutFor.trim();
-            }
-            if (synthesisParsed.howToVerify?.trim()) {
-              threeLineSummary.howToVerify = synthesisParsed.howToVerify.trim();
-            }
-            reorganizedByLatestSearch = Boolean(synthesisParsed.differsFromInitialAnalysis);
-          }
-        } catch (synthErr) {
-          if (serverAbortController.signal.aborted || isAbortLikeError(synthErr)) {
-            throw synthErr;
-          }
-          // Soft-fallback: keep sanitized Call A summaries if synthesis fails
-        }
-      }
-
-      if (serverAbortController.signal.aborted || res.writableEnded) {
-        return;
-      }
+      const mergedSummaries = applyFactCheckVerdictsToSummaries({
+        overallSummary: finalOverallSummary,
+        threeLineSummary,
+        factCheck,
+      });
+      finalOverallSummary = mergedSummaries.overallSummary;
+      threeLineSummary.whatItIs = mergedSummaries.threeLineSummary.whatItIs;
+      threeLineSummary.watchOutFor = mergedSummaries.threeLineSummary.watchOutFor;
+      threeLineSummary.howToVerify = mergedSummaries.threeLineSummary.howToVerify;
+      const reorganizedByLatestSearch = mergedSummaries.reorganizedByLatestSearch;
 
       return sendSuccessResponse({
         contentTitle: resolvedTitle,
@@ -2175,6 +1909,7 @@ async function startServer() {
         aiSuspicion,
         factCheck,
         reorganizedByLatestSearch,
+        usedFallbackModel,
         c2paMetadata: clientC2paMetadata,
         compressionSummary: clientCompressionSummary,
         overallStatus,
@@ -2201,6 +1936,11 @@ async function startServer() {
       if (classified.isAborted) {
         return;
       }
+      console.error('[api/analyze] request failed:', {
+        status: classified.status,
+        rawStatus: extractErrorStatus(err) ?? null,
+        message: err instanceof Error ? err.message : String(err),
+      });
       return sendErrorResponse(classified.status, classified.error);
     } finally {
       res.off('close', handleClientClose);

@@ -5,10 +5,8 @@ export const MAX_RECENT_DURATIONS = 5;
 
 export const STAGE_BASE_SECONDS: Record<AnalysisStageId, number> = {
   loading_video: 2,
-  analyzing_content: 6,
-  detecting_ai: 7,
+  analyzing_content: 7,
   fact_checking: 5,
-  summarizing: 3,
 };
 
 export interface EstimateAnalysisParams {
@@ -75,9 +73,8 @@ export function calculateBaseEstimateSeconds(params: {
   const stageSum =
     STAGE_BASE_SECONDS.loading_video +
     STAGE_BASE_SECONDS.analyzing_content +
-    (params.hasDirectVideo ? STAGE_BASE_SECONDS.detecting_ai : 0) +
     STAGE_BASE_SECONDS.fact_checking +
-    STAGE_BASE_SECONDS.summarizing;
+    (params.hasDirectVideo ? 2 : 0);
 
   const duration =
     typeof params.videoDurationSeconds === 'number' &&
@@ -86,8 +83,8 @@ export function calculateBaseEstimateSeconds(params: {
       ? Math.min(300, params.videoDurationSeconds)
       : 0;
 
-  // Add proportional processing overhead based on video length (~0.15s per second of video)
-  const durationOverhead = duration > 0 ? Math.round(duration * 0.15) : 0;
+  // Add proportional processing overhead based on video length (~0.12s per second of video)
+  const durationOverhead = duration > 0 ? Math.round(duration * 0.12) : 0;
 
   return Math.max(8, stageSum + durationOverhead);
 }

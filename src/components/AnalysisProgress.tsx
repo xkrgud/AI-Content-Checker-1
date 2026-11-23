@@ -22,23 +22,13 @@ const PIPELINE_STEPS: Array<{
   },
   {
     id: 'analyzing_content',
-    title: '02. 내용 분석',
-    description: '핵심 주장·수치·근거 구조 정리와 AI 생성 단서 점검을 동시에 진행합니다.',
-  },
-  {
-    id: 'detecting_ai',
-    title: '03. AI 생성 판별',
-    description: '영상 프레임과 소리, 메타데이터에서 AI 생성·합성 단서를 점검합니다.',
+    title: '02. 내용 · AI 단서 분석',
+    description: '핵심 주장·수치·근거 구조와 AI 생성·합성 단서를 한 번에 점검합니다.',
   },
   {
     id: 'fact_checking',
-    title: '04. 사실 확인',
-    description: '추출된 핵심 주장(최대 3개)을 Google 검색으로 찾아 실제 자료와 대조합니다.',
-  },
-  {
-    id: 'summarizing',
-    title: '05. 결과 정리',
-    description: '검색 결과를 반영해 전체 설명, 주의할 점, 신뢰성 점수를 최종 정리합니다.',
+    title: '03. 사실 확인 · 결과 정리',
+    description: '핵심 주장(최대 3개)을 Google 검색으로 확인하고 판정 결과를 요약에 정리합니다.',
   },
 ];
 

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  applyFactCheckVerdictsToSummaries,
   buildFactCheckReport,
   buildTodayDateInstruction,
   determineOverallFactCheckVerdict,
@@ -292,4 +293,77 @@ test('sanitizeInitialAnalysisText strips premature falsehood phrases from Call A
   );
   assert.ok(!cleaned.includes('잘못된 정보'));
   assert.ok(!cleaned.includes('사실이 아닙니다'));
+});
+
+test('applyFactCheckVerdictsToSummaries appends search verdicts to overallSummary and watchOutFor without LLM call', () => {
+  const factCheck = buildFactCheckReport(
+    [
+      {
+        claimId: 'c1',
+        claim: '에펠탑 높이는 100미터이다.',
+        claimType: 'fact',
+        status: 'sources_found',
+        verdict: '사실과 다름',
+        summary: '에펠탑 실제 높이는 약 330미터입니다.',
+        sources: [
+          {
+            title: '에펠탑 공식 안내',
+            url: 'https://www.toureiffel.paris/en',
+            publishedDate: '2024-01-10',
+            isOutdated: true,
+          },
+        ],
+        searchQueries: ['에펠탑 높이'],
+      },
+    ],
+    []
+  );
+
+  const merged = applyFactCheckVerdictsToSummaries({
+    overallSummary: '1차 요약 설명입니다.',
+    threeLineSummary: {
+      whatItIs: '파리 건축물 소개 영상이에요.',
+      watchOutFor: '수치 출처가 영상에 적혀 있지 않아요.',
+      howToVerify: '공식 사이트를 확인해 보세요.',
+    },
+    factCheck,
+  });
+
+  assert.equal(merged.reorganizedByLatestSearch, true);
+  assert.match(merged.overallSummary, /사실과 다른 내용이 있어요/);
+  assert.match(merged.overallSummary, /약 330미터/);
+  assert.match(merged.threeLineSummary.watchOutFor, /실제 자료와 달라 주의가 필요해요/);
+  assert.match(merged.threeLineSummary.watchOutFor, /1년이 넘은 오래된 자료/);
+});
+
+test('applyFactCheckVerdictsToSummaries skips modification when all search items errored', () => {
+  const factCheck = buildFactCheckReport(
+    [
+      {
+        claimId: 'c1',
+        claim: '테스트 주장',
+        claimType: 'fact',
+        status: 'search_error',
+        verdict: '확인 불가',
+        summary: '검색 중 오류가 났어요',
+        sources: [],
+        searchQueries: [],
+      },
+    ],
+    []
+  );
+
+  const merged = applyFactCheckVerdictsToSummaries({
+    overallSummary: '기존 요약',
+    threeLineSummary: {
+      whatItIs: '영상 소개',
+      watchOutFor: '기존 주의점',
+      howToVerify: '확인 방법',
+    },
+    factCheck,
+  });
+
+  assert.equal(merged.reorganizedByLatestSearch, false);
+  assert.equal(merged.overallSummary, '기존 요약');
+  assert.equal(merged.threeLineSummary.watchOutFor, '기존 주의점');
 });

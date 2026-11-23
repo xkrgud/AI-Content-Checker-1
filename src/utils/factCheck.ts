@@ -9,6 +9,7 @@ import type {
   FactClaimVerdict,
   OpinionClaimVerdict,
   OverallFactCheckVerdict,
+  ThreeLineSummary,
 } from '../types/analysis.ts';
 
 export const MAX_FACT_CHECK_CLAIMS = 3;
@@ -564,4 +565,91 @@ export function parseMultiClaimFactCheckResponse(
       searchQueries: allSearchQueries,
     };
   });
+}
+
+function truncateClaimSnippet(claim: string, maxLen = 48): string {
+  const cleaned = claim.replace(/\s+/g, ' ').trim();
+  if (cleaned.length <= maxLen) return cleaned;
+  return `${cleaned.slice(0, maxLen).trimEnd()}…`;
+}
+
+export function applyFactCheckVerdictsToSummaries(params: {
+  overallSummary: string;
+  threeLineSummary: ThreeLineSummary;
+  factCheck: FactCheckReport;
+}): {
+  overallSummary: string;
+  threeLineSummary: ThreeLineSummary;
+  reorganizedByLatestSearch: boolean;
+} {
+  const { factCheck } = params;
+  const items = factCheck.items ?? [];
+  const baseSummary = params.overallSummary.trim();
+  const baseThreeLine: ThreeLineSummary = { ...params.threeLineSummary };
+
+  if (items.length === 0 || (factCheck.searchErrorCount ?? 0) >= items.length) {
+    return {
+      overallSummary: baseSummary,
+      threeLineSummary: baseThreeLine,
+      reorganizedByLatestSearch: false,
+    };
+  }
+
+  const overallVerdict = factCheck.overallVerdict ?? determineOverallFactCheckVerdict(items);
+  const contradicted = items.filter((item) => item.verdict === '사실과 다름');
+  const matchedFacts = items.filter(
+    (item) => item.claimType !== 'opinion' && item.verdict === '사실과 일치'
+  );
+  const unverified = items.filter(
+    (item) => item.status === 'not_found' || item.verdict === '확인 불가'
+  );
+  const hasOutdatedSource = items.some((item) =>
+    item.sources.some((source) => Boolean(source.isOutdated))
+  );
+
+  const verdictDetails: string[] = [`[Google 검색 판정] ${overallVerdict}.`];
+  if (contradicted.length > 0) {
+    const first = contradicted[0];
+    verdictDetails.push(
+      `검색 자료와 다른 주장(${contradicted.length}건): "${truncateClaimSnippet(first.claim)}" — ${first.summary}`
+    );
+  }
+  if (matchedFacts.length > 0) {
+    verdictDetails.push(`사실과 일치하는 주장 ${matchedFacts.length}건이 검색으로 확인되었습니다.`);
+  }
+  if (unverified.length > 0) {
+    verdictDetails.push(`확인 불가 주장 ${unverified.length}건은 추가 확인이 필요합니다.`);
+  }
+  if (hasOutdatedSource) {
+    verdictDetails.push('1년이 지난 오래된 출처가 포함되어 있어 최신 자료를 함께 확인하세요.');
+  }
+
+  const combinedOverallSummary = [baseSummary, verdictDetails.join(' ')].filter(Boolean).join(' ');
+
+  const watchNotes: string[] = [];
+  if (contradicted.length > 0) {
+    watchNotes.push(
+      `Google 검색 결과 "${truncateClaimSnippet(contradicted[0].claim)}" 주장이 실제 자료와 달라 주의가 필요해요.`
+    );
+  } else if (unverified.length > 0) {
+    watchNotes.push('검색으로 확인되지 않은 주장이 있어 공식 자료로 한 번 더 확인해 보세요.');
+  } else if (matchedFacts.length > 0) {
+    watchNotes.push('검색으로 확인한 핵심 사실 주장은 최신 자료와 일치했어요.');
+  }
+  if (hasOutdatedSource) {
+    watchNotes.push('1년이 넘은 오래된 자료가 포함되어 있어 최신 발표도 살펴보세요.');
+  }
+
+  const updatedWatchOutFor = [baseThreeLine.watchOutFor.trim(), ...watchNotes]
+    .filter(Boolean)
+    .join(' ');
+
+  return {
+    overallSummary: combinedOverallSummary,
+    threeLineSummary: {
+      ...baseThreeLine,
+      watchOutFor: updatedWatchOutFor,
+    },
+    reorganizedByLatestSearch: factCheck.verifiedCount > 0 || contradicted.length > 0,
+  };
 }

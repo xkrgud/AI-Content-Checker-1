@@ -79,9 +79,7 @@ export interface ChecklistItem {
 export type AnalysisStageId =
   | 'loading_video'
   | 'analyzing_content'
-  | 'detecting_ai'
-  | 'fact_checking'
-  | 'summarizing';
+  | 'fact_checking';
 
 export interface C2paMetadataSummary {
   hasManifest: boolean;
@@ -255,6 +253,7 @@ export interface AnalysisReport {
   aiSuspicion?: AiSuspicionReport;
   factCheck?: FactCheckReport;
   reorganizedByLatestSearch?: boolean;
+  usedFallbackModel?: boolean;
   c2paMetadata?: C2paMetadataSummary | null;
   compressionSummary?: VideoCompressionSummary | null;
   elapsedSeconds?: number;

@@ -207,6 +207,14 @@ export const AnalysisReportView: React.FC<AnalysisReportViewProps> = ({
                 <span data-testid="report-elapsed-seconds">{report.elapsedSeconds}초 소요</span>
               </>
             )}
+            {report.usedFallbackModel && (
+              <span
+                data-testid="fallback-model-notice"
+                className="rounded border border-slate-200 bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-700"
+              >
+                가벼운 모델로 분석했어요
+              </span>
+            )}
           </div>
           <h1 className="mt-1.5 text-2xl font-bold tracking-tight text-slate-950 sm:text-3xl">
             {report.contentTitle}
@@ -836,7 +844,9 @@ export const AnalysisReportView: React.FC<AnalysisReportViewProps> = ({
                               </span>
                             </div>
                             <p className="text-xs text-rose-900">
-                              Google 검색 요청 중 일시적인 오류가 발생해 판정하지 못했어요. 잠시 후 다시 시도하거나 아래 추천 검색어로 직접 확인해 주세요.
+                              {item.summary && item.summary !== '검색 중 오류가 났어요'
+                                ? item.summary
+                                : 'Google 검색 요청 중 일시적인 오류가 발생해 판정하지 못했어요. 잠시 후 다시 시도하거나 아래 추천 검색어로 직접 확인해 주세요.'}
                             </p>
                           </article>
                         ))}

@@ -39,7 +39,7 @@ test('calculateBaseEstimateSeconds sums stages and scales proportionally with vi
   const shortVideo = calculateBaseEstimateSeconds({ hasDirectVideo: true, videoDurationSeconds: 15 });
   const longVideo = calculateBaseEstimateSeconds({ hasDirectVideo: true, videoDurationSeconds: 180 });
 
-  assert.equal(textOnly, 16);
+  assert.equal(textOnly, 14);
   assert.ok(shortVideo > textOnly);
   assert.ok(longVideo > shortVideo);
 });

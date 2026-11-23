@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { classifyAnalyzeError } from './errorClassifier';
+import { classifyAnalyzeError, isQuotaExhaustedError } from './errorClassifier';
 
 test('classifyAnalyzeError treats missing/invalid model NOT_FOUND as model error, not video error', () => {
   const err = Object.assign(
@@ -13,13 +13,15 @@ test('classifyAnalyzeError treats missing/invalid model NOT_FOUND as model error
   assert.doesNotMatch(result.error, /영상을 불러올 수 없어요/);
 });
 
-test('classifyAnalyzeError treats 429 RESOURCE_EXHAUSTED as quota exceeded', () => {
+test('classifyAnalyzeError treats 429 RESOURCE_EXHAUSTED as quota exceeded with KST 5pm guidance', () => {
   const err = Object.assign(new Error('429 RESOURCE_EXHAUSTED: Quota exceeded for metric'), {
     status: 429,
   });
+  assert.equal(isQuotaExhaustedError(err), true);
   const result = classifyAnalyzeError(err, { isYouTubeVideo: true });
   assert.equal(result.status, 429);
-  assert.match(result.error, /한도/);
+  assert.match(result.error, /오늘 무료 사용량을 다 썼어요/);
+  assert.match(result.error, /한국 시간 오후 5시/);
   assert.doesNotMatch(result.error, /영상을 불러올 수 없어요/);
 });
 

@@ -4,12 +4,23 @@ export interface ClassifiedAnalyzeError {
   isAborted?: boolean;
 }
 
-function extractErrorStatus(err: unknown): number | undefined {
+export const QUOTA_EXHAUSTED_USER_MESSAGE =
+  '오늘 무료 사용량을 다 썼어요. 한국 시간 오후 5시쯤 다시 시도해 주세요';
+
+export function extractErrorStatus(err: unknown): number | undefined {
   if (typeof err === 'object' && err !== null && 'status' in err) {
     const val = (err as { status?: unknown }).status;
     if (typeof val === 'number') return val;
   }
   return undefined;
+}
+
+export function isQuotaExhaustedError(err: unknown): boolean {
+  if (!err) return false;
+  const statusCode = extractErrorStatus(err);
+  if (statusCode === 429) return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  return /RESOURCE_EXHAUSTED|\b429\b|quota exceeded|rate limit|too many requests/i.test(msg);
 }
 
 export function isAbortLikeError(err: unknown): boolean {
@@ -46,13 +57,10 @@ export function classifyAnalyzeError(
     };
   }
 
-  if (
-    statusCode === 429 ||
-    /RESOURCE_EXHAUSTED|\b429\b|quota exceeded|rate limit|too many requests/i.test(msg)
-  ) {
+  if (isQuotaExhaustedError(err)) {
     return {
       status: 429,
-      error: '요청 한도를 초과했습니다. 잠시 후 다시 시도해 주세요.',
+      error: QUOTA_EXHAUSTED_USER_MESSAGE,
     };
   }
 

@@ -603,6 +603,7 @@ export default function App() {
         aiSuspicion: finalPayload.aiSuspicion,
         factCheck: finalPayload.factCheck,
         reorganizedByLatestSearch: Boolean(finalPayload.reorganizedByLatestSearch),
+        usedFallbackModel: Boolean(finalPayload.usedFallbackModel),
         c2paMetadata: finalPayload.c2paMetadata ?? c2paMetadata ?? undefined,
         compressionSummary: finalPayload.compressionSummary ?? compressionSummary ?? undefined,
         elapsedSeconds,
