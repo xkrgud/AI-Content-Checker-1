@@ -1831,7 +1831,7 @@ async function startServer() {
             config: {
               systemInstruction: `${todayDateInstruction}\n\n당신은 Google 검색 최신 자료를 바탕으로 주장을 대조·판정하는 팩트체크 도우미입니다. 검색 시 제품명·사건명과 올해 연도(${currentYear}년)를 포함해 최신 자료를 우선 찾고, 근거가 없으면 반드시 "확인 불가"로 표시하세요. 중학생도 이해하기 쉬운 한국어 한 문장으로 이유를 적으세요.`,
               tools: [{ googleSearch: {} }],
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              thinkingConfig: { thinkingBudget: 0 },
               abortSignal: serverAbortController.signal,
             },
           });
