@@ -25,23 +25,29 @@ import {
   parseIso8601DurationSeconds,
 } from './src/utils/aiSuspicion.ts';
 import {
-  MAX_UPLOAD_VIDEO_BYTES,
+  CLOUD_RUN_SAFE_UPLOAD_BYTES,
+  MAX_SERVER_MULTIPART_BYTES,
   shouldUseGeminiFileApi,
+  VIDEO_TOO_LARGE_CUT_ERROR,
   validateVideoFileMeta,
 } from './src/utils/videoUpload.ts';
 import {
   buildFactCheckReport,
+  buildTodayDateInstruction,
   parseMultiClaimFactCheckResponse,
+  sanitizeInitialAnalysisText,
   selectClaimsForFactCheck,
 } from './src/utils/factCheck.ts';
 import { classifyAnalyzeError, isAbortLikeError } from './src/utils/errorClassifier.ts';
-import { createIpRateLimiter, normalizeClientIp } from './src/utils/rateLimiter.ts';
+import { createAnalyzeRateLimiter, normalizeClientIp } from './src/utils/rateLimiter.ts';
 import type {
   AiGenerationAssessment,
   AiLogoClue,
   AiSuspicionReport,
   AiTimestampClue,
+  AnalysisStageId,
   AnalyzedVideoInfo,
+  C2paMetadataSummary,
   ChecklistItem,
   ChecklistVerdict,
   ClaimFactCheck,
@@ -54,6 +60,8 @@ import type {
   SourceAssessment,
   ThreeLineSummary,
   UrlInspectionResult,
+  VideoCompressionSummary,
+  YouTubeCreatorCheckStatus,
 } from './src/types/analysis.ts';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -192,7 +200,14 @@ function decodeHtmlEntities(input: string): string {
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
     .replace(/&#39;|&apos;/g, "'")
-    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => {
+      const code = parseInt(hex, 16);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : _;
+    })
+    .replace(/&#(\d+);/g, (_, code) => {
+      const num = Number(code);
+      return Number.isFinite(num) ? String.fromCodePoint(num) : _;
+    })
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -253,10 +268,10 @@ interface YouTubeDataApiDetails {
 async function fetchYouTubeDataApiDetails(
   videoId: string,
   signal?: AbortSignal
-): Promise<YouTubeDataApiDetails | null> {
+): Promise<{ status: YouTubeCreatorCheckStatus; data: YouTubeDataApiDetails | null }> {
   const ytKey = process.env.YOUTUBE_API_KEY?.trim();
   if (!ytKey || ytKey === 'MY_YOUTUBE_API_KEY') {
-    return null;
+    return { status: 'no_api_key', data: null };
   }
 
   const controller = new AbortController();
@@ -274,7 +289,7 @@ async function fetchYouTubeDataApiDetails(
       headers: { Accept: 'application/json' },
     });
     if (!response.ok) {
-      return null;
+      return { status: 'failed', data: null };
     }
     const payload = (await response.json()) as {
       items?: Array<{
@@ -295,21 +310,24 @@ async function fetchYouTubeDataApiDetails(
     };
     const item = payload.items?.[0];
     if (!item) {
-      return null;
+      return { status: 'failed', data: null };
     }
 
     const thumbs = item.snippet?.thumbnails;
     return {
-      containsSyntheticMedia: Boolean(item.status?.containsSyntheticMedia),
-      title: item.snippet?.title?.trim(),
-      description: item.snippet?.description?.trim(),
-      tags: Array.isArray(item.snippet?.tags) ? item.snippet.tags.filter(Boolean) : [],
-      channelTitle: item.snippet?.channelTitle?.trim(),
-      thumbnailUrl: thumbs?.high?.url || thumbs?.medium?.url || thumbs?.default?.url,
-      durationSeconds: parseIso8601DurationSeconds(item.contentDetails?.duration),
+      status: 'checked',
+      data: {
+        containsSyntheticMedia: Boolean(item.status?.containsSyntheticMedia),
+        title: item.snippet?.title?.trim(),
+        description: item.snippet?.description?.trim(),
+        tags: Array.isArray(item.snippet?.tags) ? item.snippet.tags.filter(Boolean) : [],
+        channelTitle: item.snippet?.channelTitle?.trim(),
+        thumbnailUrl: thumbs?.high?.url || thumbs?.medium?.url || thumbs?.default?.url,
+        durationSeconds: parseIso8601DurationSeconds(item.contentDetails?.duration),
+      },
     };
   } catch {
-    return null;
+    return { status: 'failed', data: null };
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', onParentAbort);
@@ -438,7 +456,7 @@ const analysisResponseSchema = {
     overallSummary: {
       type: Type.STRING,
       description:
-        '전체적인 분석 요약 (2~3문장). 참/거짓을 단정하지 않고, 중학생도 이해하기 쉬운 말로 어떤 점을 참고하고 확인하면 좋은지 설명.',
+        '1차 내용 정리 요약 (2~3문장). 참/거짓을 판정하거나 "잘못된 정보", "사실이 아님"이라고 말하지 말고, 이 콘텐츠가 어떤 주장과 근거 구조를 제시하는지만 중학생도 이해하기 쉽게 정리.',
     },
     coreClaims: {
       type: Type.ARRAY,
@@ -446,6 +464,11 @@ const analysisResponseSchema = {
         type: Type.OBJECT,
         properties: {
           id: { type: Type.STRING },
+          claimType: {
+            type: Type.STRING,
+            description:
+              '반드시 "fact" 또는 "opinion" 중 하나. 수치·사건·제품 사양·공식 발표처럼 객관적으로 확인할 수 있는 사실 주장은 "fact", 사용 후기·개인 느낌·평가·추천은 "opinion".',
+          },
           claim: {
             type: Type.STRING,
             description: '콘텐츠에서 말하는 핵심 주장 (쉬운 말로)',
@@ -460,7 +483,7 @@ const analysisResponseSchema = {
             description: '이 말이 맞는지 확인하려면 어떤 자료를 찾아봐야 하는지 쉬운 말로 설명',
           },
         },
-        required: ['id', 'claim', 'specificFiguresAndFacts', 'evidenceNeeds'],
+        required: ['id', 'claimType', 'claim', 'specificFiguresAndFacts', 'evidenceNeeds'],
       },
     },
     exaggeratedExpressions: {
@@ -731,21 +754,25 @@ async function startServer() {
   app.set('trust proxy', 1);
   app.use(express.json({ limit: '10mb' }));
 
-  const analyzeRateLimiter = createIpRateLimiter({ maxRequests: 5, windowMs: 60_000 });
+  const analyzeRateLimiter = createAnalyzeRateLimiter({
+    browserMaxRequests: 5,
+    ipMaxRequests: 60,
+    windowMs: 60_000,
+  });
   const uploadTempDir = path.join(os.tmpdir(), 'ai-content-checker-uploads');
   fs.mkdirSync(uploadTempDir, { recursive: true });
 
   const videoUploadMiddleware = multer({
     dest: uploadTempDir,
     limits: {
-      fileSize: MAX_UPLOAD_VIDEO_BYTES,
+      fileSize: MAX_SERVER_MULTIPART_BYTES,
       files: 1,
     },
   });
 
   const shareFallbackParser = multer({
     dest: uploadTempDir,
-    limits: { fileSize: MAX_UPLOAD_VIDEO_BYTES, files: 1 },
+    limits: { fileSize: MAX_SERVER_MULTIPART_BYTES, files: 1 },
   });
 
   const maybeParseMultipartVideo: express.RequestHandler = (req, res, next) => {
@@ -759,8 +786,8 @@ async function startServer() {
         return;
       }
       if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
-        res.status(400).json({
-          error: '영상 파일 용량은 최대 500MB 이하까지만 업로드할 수 있어요.',
+        res.status(413).json({
+          error: VIDEO_TOO_LARGE_CUT_ERROR,
         });
         return;
       }
@@ -842,6 +869,50 @@ async function startServer() {
     };
     res.on('close', handleClientClose);
 
+    const wantsStream =
+      Boolean(req.get('accept')?.includes('application/x-ndjson')) ||
+      req.get('x-stream-progress') === '1';
+    let streamStarted = false;
+
+    const startStreamIfWanted = () => {
+      if (!wantsStream || streamStarted || res.headersSent) return;
+      streamStarted = true;
+      res.status(200);
+      res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders?.();
+    };
+
+    const emitStreamEvent = (event: Record<string, unknown>) => {
+      if (!wantsStream || !streamStarted || res.writableEnded) return;
+      res.write(`${JSON.stringify(event)}\n`);
+    };
+
+    const emitStageProgress = (stage: AnalysisStageId) => {
+      emitStreamEvent({ type: 'progress', stage });
+    };
+
+    const sendErrorResponse = (status: number, error: string) => {
+      if (res.writableEnded) return;
+      if (wantsStream && streamStarted) {
+        res.write(`${JSON.stringify({ type: 'error', status, error })}\n`);
+        res.end();
+        return;
+      }
+      res.status(status).json({ error });
+    };
+
+    const sendSuccessResponse = (payload: Record<string, unknown>) => {
+      if (res.writableEnded) return;
+      if (wantsStream && streamStarted) {
+        res.write(`${JSON.stringify({ type: 'result', data: payload })}\n`);
+        res.end();
+        return;
+      }
+      res.json(payload);
+    };
+
     let isYouTubeVideo = false;
 
     try {
@@ -856,21 +927,99 @@ async function startServer() {
       const imageDataUrl =
         typeof req.body?.imageDataUrl === 'string' ? req.body.imageDataUrl.trim() : undefined;
 
+      const parseOptionalJson = <T>(raw: unknown): T | null => {
+        if (!raw) return null;
+        if (typeof raw === 'object') return raw as T;
+        if (typeof raw === 'string') {
+          try {
+            return JSON.parse(raw) as T;
+          } catch {
+            return null;
+          }
+        }
+        return null;
+      };
+
+      const parsedC2paRaw = parseOptionalJson<C2paMetadataSummary>(req.body?.c2paMetadata);
+      const clientC2paMetadata: C2paMetadataSummary | null =
+        parsedC2paRaw && parsedC2paRaw.hasManifest
+          ? {
+              hasManifest: true,
+              claimGenerator:
+                typeof parsedC2paRaw.claimGenerator === 'string'
+                  ? parsedC2paRaw.claimGenerator.slice(0, 120)
+                  : undefined,
+              title:
+                typeof parsedC2paRaw.title === 'string'
+                  ? parsedC2paRaw.title.slice(0, 120)
+                  : undefined,
+              issuer:
+                typeof parsedC2paRaw.issuer === 'string'
+                  ? parsedC2paRaw.issuer.slice(0, 120)
+                  : undefined,
+              signedAt:
+                typeof parsedC2paRaw.signedAt === 'string'
+                  ? parsedC2paRaw.signedAt.slice(0, 64)
+                  : undefined,
+              digitalSourceType:
+                typeof parsedC2paRaw.digitalSourceType === 'string'
+                  ? parsedC2paRaw.digitalSourceType.slice(0, 160)
+                  : undefined,
+              isAiGeneratedClaim: Boolean(parsedC2paRaw.isAiGeneratedClaim),
+              actions: Array.isArray(parsedC2paRaw.actions)
+                ? parsedC2paRaw.actions.filter((a): a is string => typeof a === 'string').slice(0, 6)
+                : undefined,
+              validationState:
+                typeof parsedC2paRaw.validationState === 'string'
+                  ? parsedC2paRaw.validationState.slice(0, 40)
+                  : undefined,
+            }
+          : null;
+
+      const parsedCompressionRaw = parseOptionalJson<VideoCompressionSummary>(
+        req.body?.compressionSummary
+      );
+      const clientCompressionSummary: VideoCompressionSummary | null =
+        parsedCompressionRaw &&
+        typeof parsedCompressionRaw.originalSizeBytes === 'number' &&
+        typeof parsedCompressionRaw.compressedSizeBytes === 'number'
+          ? {
+              wasCompressed: Boolean(parsedCompressionRaw.wasCompressed),
+              originalSizeBytes: parsedCompressionRaw.originalSizeBytes,
+              compressedSizeBytes: parsedCompressionRaw.compressedSizeBytes,
+              durationSeconds:
+                typeof parsedCompressionRaw.durationSeconds === 'number'
+                  ? parsedCompressionRaw.durationSeconds
+                  : undefined,
+            }
+          : null;
+
+      const rawClientDuration = Number(req.body?.videoDurationSeconds);
+      const clientDurationSeconds =
+        Number.isFinite(rawClientDuration) && rawClientDuration > 0 ? rawClientDuration : null;
+
       if (!['url', 'text', 'image'].includes(inputMode)) {
-        return res.status(400).json({ error: '올바른 분석 입력 방식을 선택해 주세요.' });
+        return sendErrorResponse(400, '올바른 분석 입력 방식을 선택해 주세요.');
       }
 
       let resolvedUploadedMime: string | undefined;
       if (uploadedFile) {
-        const videoValidation = validateVideoFileMeta({
-          name: uploadedFile.originalname || 'video.mp4',
-          type: uploadedFile.mimetype,
-          size: uploadedFile.size,
-        });
+        const videoValidation = validateVideoFileMeta(
+          {
+            name: uploadedFile.originalname || 'video.mp4',
+            type: uploadedFile.mimetype,
+            size: uploadedFile.size,
+          },
+          {
+            maxBytes: CLOUD_RUN_SAFE_UPLOAD_BYTES,
+            maxBytesError: VIDEO_TOO_LARGE_CUT_ERROR,
+          }
+        );
         if (!videoValidation.valid || !videoValidation.mimeType) {
-          return res.status(400).json({
-            error: videoValidation.error || 'MP4, MOV 등 지원되는 영상 파일만 업로드할 수 있어요.',
-          });
+          return sendErrorResponse(
+            400,
+            videoValidation.error || 'MP4, MOV 등 지원되는 영상 파일만 업로드할 수 있어요.'
+          );
         }
         resolvedUploadedMime = videoValidation.mimeType;
       }
@@ -884,9 +1033,7 @@ async function startServer() {
         if (sourceUrl) {
           const validation = validateAndNormalizeUrl(sourceUrl);
           if (!validation.valid || !validation.normalizedUrl || !validation.platform) {
-            return res
-              .status(400)
-              .json({ error: validation.error || '올바른 URL을 입력해 주세요.' });
+            return sendErrorResponse(400, validation.error || '올바른 URL을 입력해 주세요.');
           }
           normalizedUrl = validation.normalizedUrl;
           platform = validation.platform;
@@ -895,56 +1042,74 @@ async function startServer() {
           isYouTubeVideo = platform === 'youtube' && Boolean(youtubeVideoId);
 
           if (platform === 'instagram' && !uploadedFile) {
-            return res.status(422).json({
-              error:
-                "인스타 릴스는 링크로 영상을 볼 수 없어요. 인스타 공유 버튼 → '다운로드'로 저장한 뒤 영상을 올려 주세요. 게시물에 'AI 정보' 표시가 있는지도 직접 확인해 보세요.",
-            });
+            return sendErrorResponse(
+              422,
+              "인스타 릴스는 링크로 영상을 볼 수 없어요. 인스타 공유 버튼 → '다운로드'로 저장한 뒤 영상을 올려 주세요. 게시물에 'AI 정보' 표시가 있는지도 직접 확인해 보세요."
+            );
           }
 
           if (!isYouTubeVideo && !uploadedFile && transcriptOrNotes.length < 8) {
-            return res.status(422).json({
-              error:
-                '영상을 불러올 수 없어요. 이 링크는 플랫폼 제한으로 영상을 직접 불러올 수 없으니 아래 입력란에 영상 내용이나 자막을 입력해 주세요.',
-            });
+            return sendErrorResponse(
+              422,
+              '영상을 불러올 수 없어요. 이 링크는 플랫폼 제한으로 영상을 직접 불러올 수 없으니 아래 입력란에 영상 내용이나 자막을 입력해 주세요.'
+            );
           }
         } else if (uploadedFile) {
           normalizedUrl = undefined;
           platform = platform || 'web';
           urlIsShortVideo = true;
         } else {
-          return res.status(400).json({ error: '분석할 영상 링크를 입력하거나 영상을 올려 주세요.' });
+          return sendErrorResponse(400, '분석할 영상 링크를 입력하거나 영상을 올려 주세요.');
         }
       } else if (inputMode === 'text') {
         if (textContent.length < 8) {
-          return res.status(400).json({ error: '분석할 텍스트를 8자 이상 입력해 주세요.' });
+          return sendErrorResponse(400, '분석할 텍스트를 8자 이상 입력해 주세요.');
         }
       } else if (inputMode === 'image') {
         if (!imageDataUrl) {
-          return res.status(400).json({ error: '분석할 이미지를 업로드해 주세요.' });
+          return sendErrorResponse(400, '분석할 이미지를 업로드해 주세요.');
         }
       }
 
-      // Count 1 slot per /api/analyze execution per IP (regardless of internal oEmbed/retry calls)
+      // Count 1 slot per /api/analyze execution: 5/min per browser ID, 60/min per IP (school Wi-Fi friendly)
       const clientIp = normalizeClientIp(req.ip || req.socket?.remoteAddress);
-      const rateLimit = analyzeRateLimiter.consume(clientIp);
+      const clientIdHeader = req.get('x-client-id');
+      const clientIdBody = typeof req.body?.clientId === 'string' ? req.body.clientId : undefined;
+      const rateLimit = analyzeRateLimiter.consume({
+        clientId: clientIdHeader || clientIdBody,
+        ip: clientIp,
+      });
       if (!rateLimit.allowed) {
         res.setHeader('Retry-After', String(rateLimit.retryAfterSeconds));
-        return res.status(429).json({
-          error: '잠시 후 다시 시도해 주세요. (1분에 최대 5회까지만 분석할 수 있어요.)',
-        });
+        return sendErrorResponse(
+          429,
+          rateLimit.limitedBy === 'ip'
+            ? '같은 네트워크(IP)에서 요청이 너무 많아요. 잠시 후 다시 시도해 주세요. (IP당 1분에 최대 60회)'
+            : '잠시 후 다시 시도해 주세요. (브라우저당 1분에 최대 5회까지만 분석할 수 있어요.)'
+        );
       }
+
+      // Validation and rate limiting passed -> switch to NDJSON progress stream if requested
+      startStreamIfWanted();
+      emitStageProgress('loading_video');
 
       let youtubeMeta: { title?: string; author?: string; thumbnailUrl?: string } = {};
       let ytData: YouTubeDataApiDetails | null = null;
+      let ytCheckStatus: YouTubeCreatorCheckStatus | undefined;
       let linkMeta: { title?: string; descriptionText?: string } = {};
 
       if (inputMode === 'url' && isYouTubeVideo && normalizedUrl) {
-        const [oembedResult, ytApiResult] = await Promise.all([
+        const [oembedResult, ytApiResponse] = await Promise.all([
           fetchYouTubeOEmbed(normalizedUrl),
           youtubeVideoId
             ? fetchYouTubeDataApiDetails(youtubeVideoId, serverAbortController.signal)
-            : Promise.resolve(null),
+            : Promise.resolve({
+                status: 'failed' as YouTubeCreatorCheckStatus,
+                data: null,
+              }),
         ]);
+        ytCheckStatus = ytApiResponse.status;
+        const ytApiResult = ytApiResponse.data;
         youtubeMeta = {
           title: ytApiResult?.title || oembedResult.title,
           author: ytApiResult?.channelTitle || oembedResult.author,
@@ -973,6 +1138,9 @@ async function startServer() {
         return;
       }
 
+      const resolvedDurationSeconds =
+        ytData?.durationSeconds ?? clientDurationSeconds ?? clientCompressionSummary?.durationSeconds ?? null;
+
       const clientIsShortVideo =
         req.body?.isShortVideo === true || req.body?.isShortVideo === 'true';
       const isShortVideo = Boolean(
@@ -980,9 +1148,15 @@ async function startServer() {
           urlIsShortVideo ||
           platform === 'instagram' ||
           (!normalizedUrl && uploadedFile) ||
-          (ytData?.durationSeconds != null && ytData.durationSeconds <= 90)
+          (resolvedDurationSeconds != null && resolvedDurationSeconds <= 90)
       );
       const sampledFps = isShortVideo ? 4 : 1;
+
+      emitStreamEvent({
+        type: 'meta',
+        videoDurationSeconds: resolvedDurationSeconds,
+        hasDirectVideo: Boolean((isYouTubeVideo && normalizedUrl) || uploadedFile),
+      });
 
       const ai = new GoogleGenAI({
         apiKey,
@@ -1084,14 +1258,15 @@ async function startServer() {
           /^data:(image\/(?:png|jpeg|jpg|webp|gif));base64,([A-Za-z0-9+/=]+)$/
         );
         if (!match) {
-          return res.status(400).json({
-            error: 'PNG, JPG, WEBP, GIF 형식의 올바른 이미지 파일만 분석할 수 있습니다.',
-          });
+          return sendErrorResponse(
+            400,
+            'PNG, JPG, WEBP, GIF 형식의 올바른 이미지 파일만 분석할 수 있습니다.'
+          );
         }
         const mimeType = match[1] === 'image/jpg' ? 'image/jpeg' : match[1];
         const base64Data = match[2];
         if (base64Data.length > 11_000_000) {
-          return res.status(400).json({ error: '이미지 파일 용량은 8MB 이하만 지원합니다.' });
+          return sendErrorResponse(400, '이미지 파일 용량은 8MB 이하만 지원합니다.');
         }
         parts.push({
           inlineData: {
@@ -1173,7 +1348,11 @@ async function startServer() {
 
       parts.push({ text: promptText });
 
-      const systemInstruction = `당신은 'AI Content Checker'의 친절하고 쉬운 콘텐츠 신뢰도 안내 도우미입니다.
+      const todayDateInstruction = buildTodayDateInstruction();
+
+      const systemInstruction = `${todayDateInstruction}
+
+당신은 'AI Content Checker'의 친절하고 쉬운 콘텐츠 신뢰도 안내 도우미입니다.
 모든 답변은 반드시 **중학생도 한 번에 읽고 이해할 수 있는 쉬운 한국어**로 작성하세요.
 
 말투 및 작성 원칙:
@@ -1183,8 +1362,9 @@ async function startServer() {
    - videoAccessible 필드를 정확히 판단하세요. 영상 내용을 실제로 보거나 듣지 못했다면 videoAccessible = false로 반환하세요.
 4. 어떤 영상인지와 3줄 요약(무슨 영상인지 / 주의할 점 / 이렇게 확인해 보세요)을 꼭 알기 쉽게 채워 주세요.
 5. 신뢰성 체크리스트 5개 항목(id 포함)은 당신(AI)이 직접 점검해 각각 "예", "아니오", "확인 필요" 중 하나와 쉬운 이유를 적어 주세요.
-6. 절대 "무조건 거짓이다", "100% 사실이다"라고 단정하지 마세요.
-7. 이 1차 분석에서는 콘텐츠 안의 주장과 출처 구조를 먼저 정리하고, 뒤이어 별도 Google 검색 단계에서 핵심 주장(최대 3개)의 자료를 찾아 대조합니다. 사용자가 추가로 확인해 볼 공식 자료와 검색어를 쉽게 안내해 주세요.`;
+6. coreClaims의 각 주장은 반드시 사실 주장("fact": 수치, 사건, 제품 사양, 발표처럼 객관적 확인이 가능한 것)과 의견 주장("opinion": 사용 후기, 평가, 느낌, 추천)으로 나누어 claimType에 기록하세요.
+7. 1차 분석(내용 분석)에서는 주장이 사실인지 아닌지 절대 판단하지 말고 주장만 정리하세요. "잘못된 정보", "사실이 아님", "거짓 정보", "허위 사실", "무조건 거짓", "100% 사실" 같은 표현은 절대 쓰지 마세요.
+8. 사실 확인은 이 단계 뒤의 별도 Google 검색 단계에서만 진행합니다. 이 1차 분석에서는 주장과 근거 구조를 정리하고, 사용자가 추가로 확인해 볼 공식 자료와 검색어를 안내해 주세요.`;
 
       const buildMainPartsWithCurrentVideo = (): GeminiPart[] => {
         if (!uploadedVideoPart) return parts;
@@ -1252,7 +1432,9 @@ async function startServer() {
         summaryNote?: string;
       }
 
-      const aiDetectionSystemInstruction = `당신은 AI 생성·합성 영상 단서 점검 전문가입니다.
+      const aiDetectionSystemInstruction = `${todayDateInstruction}
+
+당신은 AI 생성·합성 영상 단서 점검 전문가입니다.
 중학생도 이해하기 쉬운 한국어로 답하되, 추측으로 단서를 지어내지 마세요.
 반드시 실제로 눈으로 보고 귀로 들은 장면에 대해서만 정확한 시점(분:초, 예: 0:04)을 적으세요.
 단서가 없으면 억지로 만들지 말고 빈 배열([])을 반환하세요.
@@ -1275,13 +1457,25 @@ async function startServer() {
         '- 영상을 불러오지 못해 화면을 볼 수 없다면 videoAnalyzed를 false로 반환하세요.',
       ].join('\n');
 
+      const detectionAbortController = new AbortController();
+      const onServerAbortForDetection = () => detectionAbortController.abort();
+      if (serverAbortController.signal.aborted) {
+        detectionAbortController.abort();
+      } else {
+        serverAbortController.signal.addEventListener('abort', onServerAbortForDetection, {
+          once: true,
+        });
+      }
+
+      const detectionVideoPartSnapshot = uploadedVideoPart ? { ...uploadedVideoPart } : null;
+
       const invokeAiDetectionModel = async (
         modelName: string,
         useCodeExecution: boolean
       ) => {
-        const videoPartForDetection: GeminiPart = uploadedVideoPart
+        const videoPartForDetection: GeminiPart = detectionVideoPartSnapshot
           ? {
-              ...uploadedVideoPart,
+              ...detectionVideoPartSnapshot,
               videoMetadata: { fps: sampledFps },
             }
           : {
@@ -1302,7 +1496,7 @@ async function startServer() {
             responseSchema: aiDetectionResponseSchema,
             thinkingConfig: { thinkingLevel: ThinkingLevel.HIGH },
             ...(useCodeExecution ? { tools: [{ codeExecution: {} }] } : {}),
-            abortSignal: serverAbortController.signal,
+            abortSignal: detectionAbortController.signal,
           },
         });
       };
@@ -1323,7 +1517,7 @@ async function startServer() {
             const resWithTool = await invokeAiDetectionModel(modelName, true);
             return { text: resWithTool.text?.trim() || '', agenticVideoEnabled: true };
           } catch (toolErr) {
-            if (serverAbortController.signal.aborted || isAbortLikeError(toolErr)) {
+            if (detectionAbortController.signal.aborted || isAbortLikeError(toolErr)) {
               throw toolErr;
             }
             const msg = toolErr instanceof Error ? toolErr.message : String(toolErr);
@@ -1342,10 +1536,10 @@ async function startServer() {
             result = await generateWithRetry(
               () => tryModel('gemini-4-hydrogen'),
               1,
-              serverAbortController.signal
+              detectionAbortController.signal
             );
           } catch (primaryErr) {
-            if (serverAbortController.signal.aborted || isAbortLikeError(primaryErr)) {
+            if (detectionAbortController.signal.aborted || isAbortLikeError(primaryErr)) {
               throw primaryErr;
             }
             const primaryMsg =
@@ -1354,7 +1548,7 @@ async function startServer() {
               result = await generateWithRetry(
                 () => tryModel('gemini-3.1-flash-lite'),
                 1,
-                serverAbortController.signal
+                detectionAbortController.signal
               );
             } else {
               throw primaryErr;
@@ -1382,7 +1576,7 @@ async function startServer() {
             raw: parsedAi,
           };
         } catch (err) {
-          if (serverAbortController.signal.aborted || isAbortLikeError(err)) {
+          if (detectionAbortController.signal.aborted || isAbortLikeError(err)) {
             throw err;
           }
           // Soft-degrade AI detection call to '판별 불가' if main analysis succeeds
@@ -1390,25 +1584,43 @@ async function startServer() {
         }
       };
 
-      const response = await runMainAnalysisWithFallback();
+      // Run Call A (content analysis) and Call B (AI detection) concurrently when direct video is present
+      emitStageProgress('analyzing_content');
+      const mainAnalysisPromise = runMainAnalysisWithFallback();
+      const aiDetectionPromise = hasDirectVideoInput
+        ? runSeparateAiDetection()
+        : Promise.resolve({ succeeded: false, agenticVideoEnabled: false, raw: null });
+      aiDetectionPromise.catch(() => undefined);
+
+      let response;
+      try {
+        response = await mainAnalysisPromise;
+      } catch (mainErr) {
+        detectionAbortController.abort();
+        serverAbortController.signal.removeEventListener('abort', onServerAbortForDetection);
+        throw mainErr;
+      }
 
       if (serverAbortController.signal.aborted || res.writableEnded) {
+        detectionAbortController.abort();
+        serverAbortController.signal.removeEventListener('abort', onServerAbortForDetection);
         return;
       }
 
       const rawText = response.text?.trim();
       if (!rawText) {
+        detectionAbortController.abort();
+        serverAbortController.signal.removeEventListener('abort', onServerAbortForDetection);
         if (hasDirectVideoInput) {
-          return res.status(422).json({
-            error: '영상을 불러올 수 없어요. 영상 파일이나 링크 상태를 확인해 주세요.',
-          });
+          return sendErrorResponse(
+            422,
+            '영상을 불러올 수 없어요. 영상 파일이나 링크 상태를 확인해 주세요.'
+          );
         }
-        return res.status(502).json({
-          error: 'AI 분석 응답이 비어 있습니다. 잠시 후 다시 시도해 주세요.',
-        });
+        return sendErrorResponse(502, 'AI 분석 응답이 비어 있습니다. 잠시 후 다시 시도해 주세요.');
       }
 
-      const parsed = JSON.parse(rawText) as {
+      let parsed: {
         videoAccessible?: boolean;
         contentTitle?: string;
         whatVideoIsAbout?: string;
@@ -1429,15 +1641,32 @@ async function startServer() {
         additionalVerificationSteps?: string[];
       };
 
-      if (hasDirectVideoInput && parsed.videoAccessible === false) {
-        return res.status(422).json({
-          error: isYouTubeVideo
-            ? '영상을 불러올 수 없어요. 비공개·삭제된 영상이거나 접근할 수 없는 유튜브 링크인지 확인해 주세요.'
-            : '영상을 불러올 수 없어요. 업로드한 영상 파일이 손상되지 않았는지 확인해 주세요.',
-        });
+      try {
+        parsed = JSON.parse(rawText);
+      } catch (parseErr) {
+        detectionAbortController.abort();
+        serverAbortController.signal.removeEventListener('abort', onServerAbortForDetection);
+        throw parseErr;
       }
 
-      const aiDetectionOutcome = await runSeparateAiDetection();
+      if (hasDirectVideoInput && parsed.videoAccessible === false) {
+        // Call A reports video could not be loaded -> abort & discard Call B completely
+        detectionAbortController.abort();
+        serverAbortController.signal.removeEventListener('abort', onServerAbortForDetection);
+        return sendErrorResponse(
+          422,
+          isYouTubeVideo
+            ? '영상을 불러올 수 없어요. 비공개·삭제된 영상이거나 접근할 수 없는 유튜브 링크인지 확인해 주세요.'
+            : '영상을 불러올 수 없어요. 업로드한 영상 파일이 손상되지 않았는지 확인해 주세요.'
+        );
+      }
+
+      if (hasDirectVideoInput) {
+        emitStageProgress('detecting_ai');
+      }
+      const aiDetectionOutcome = await aiDetectionPromise.finally(() => {
+        serverAbortController.signal.removeEventListener('abort', onServerAbortForDetection);
+      });
 
       if (serverAbortController.signal.aborted || res.writableEnded) {
         return;
@@ -1446,6 +1675,7 @@ async function startServer() {
       const coreClaims: CoreClaim[] = Array.isArray(parsed.coreClaims)
         ? parsed.coreClaims.map((item, idx) => ({
             id: item.id || `claim-${idx + 1}`,
+            claimType: item.claimType === 'opinion' ? 'opinion' : 'fact',
             claim: item.claim || '',
             specificFiguresAndFacts: Array.isArray(item.specificFiguresAndFacts)
               ? item.specificFiguresAndFacts.filter(Boolean)
@@ -1597,6 +1827,7 @@ async function startServer() {
         level: suspicionBreakdown.level,
         breakdown: suspicionBreakdown,
         creatorDisclosedSyntheticMedia: Boolean(ytData?.containsSyntheticMedia),
+        youtubeCreatorCheckStatus: isYouTubeVideo ? ytCheckStatus : undefined,
         aiLogos,
         visualAndAudioClues,
         metadataKeywords,
@@ -1644,17 +1875,21 @@ async function startServer() {
         thumbnailUrl: youtubeMeta.thumbnailUrl,
         normalizedUrl,
         uploadedFileName: uploadedFile?.originalname,
-        whatVideoIsAbout: parsed.whatVideoIsAbout || parsed.inputSummary || '',
+        whatVideoIsAbout: sanitizeInitialAnalysisText(
+          parsed.whatVideoIsAbout || parsed.inputSummary || ''
+        ),
+        durationSeconds: resolvedDurationSeconds ?? undefined,
       };
 
+      let finalOverallSummary = sanitizeInitialAnalysisText(parsed.overallSummary || '');
       const threeLineSummary: ThreeLineSummary = {
         whatItIs:
-          parsed.threeLineSummary?.whatItIs?.trim() ||
-          parsed.whatVideoIsAbout ||
-          parsed.inputSummary ||
+          sanitizeInitialAnalysisText(parsed.threeLineSummary?.whatItIs || '') ||
+          analyzedVideoInfo.whatVideoIsAbout ||
+          sanitizeInitialAnalysisText(parsed.inputSummary || '') ||
           '입력한 콘텐츠의 내용을 정리했어요.',
         watchOutFor:
-          parsed.threeLineSummary?.watchOutFor?.trim() ||
+          sanitizeInitialAnalysisText(parsed.threeLineSummary?.watchOutFor || '') ||
           (exaggeratedExpressions.length > 0
             ? `과장되거나 오해하기 쉬운 표현이 ${exaggeratedExpressions.length}개 보여서 조심해서 봐야 해요.`
             : '출처와 근거가 충분한지 한 번 더 살펴보는 게 좋아요.'),
@@ -1667,6 +1902,8 @@ async function startServer() {
       const { toCheck: claimsToFactCheck, remaining: remainingUncheckedClaims } =
         selectClaimsForFactCheck(coreClaims);
 
+      const currentYear = new Date().getFullYear();
+
       const runFactCheckBatchWithGoogleSearch = async (
         claims: CoreClaim[]
       ): Promise<ClaimFactCheck[]> => {
@@ -1675,29 +1912,41 @@ async function startServer() {
         const claimBlocksPrompt = claims
           .map((item, idx) => {
             const num = idx + 1;
+            const typeLabel = item.claimType === 'opinion' ? '의견 주장' : '사실 주장';
             const factsNote =
               item.specificFiguresAndFacts.length > 0
                 ? ` (언급된 수치·내용: ${item.specificFiguresAndFacts.join(', ')})`
                 : '';
-            return `${num}. ${item.claim}${factsNote}`;
+            return `${num}. [${typeLabel}] ${item.claim}${factsNote}`;
           })
           .join('\n');
 
         const factPrompt = [
-          '아래 핵심 주장(최대 3개)을 각각 Google 검색 도구(google_search)로 검색하여 공식 기관 발표, 통계, 언론 보도 등 실제 자료를 확인해 주세요.',
+          `아래 핵심 주장(최대 3개, 사실 주장 우선 선별)을 각각 Google 검색 도구(google_search)로 검색해 최신 자료를 기준으로 판정해 주세요.`,
+          `검색 전략: 반드시 제품명·사건명·인물명과 **${currentYear}년**(올해 연도)을 검색어에 함께 넣어 최신 공식 자료·언론 보도·리뷰를 우선 찾으세요.`,
           resolvedTitle ? `[콘텐츠 제목 맥락]\n${resolvedTitle}` : '',
           `[확인할 핵심 주장 목록]\n${claimBlocksPrompt}`,
-          '출력 형식 규칙 (반드시 아래 태그 형식을 각 주장 번호에 맞춰 정확히 지켜 주세요):',
+          '출력 형식 규칙 (반드시 아래 태그와 항목 이름을 각 주장 번호에 맞춰 정확히 지켜 주세요):',
           claims
-            .map(
-              (_, idx) =>
-                `[CLAIM ${idx + 1}]\n검색된 자료에 따르면 ... (또는 자료가 없으면 정확히: 확인된 자료 없음)\n[/CLAIM ${idx + 1}]`
-            )
+            .map((item, idx) => {
+              const allowedVerdicts =
+                item.claimType === 'opinion'
+                  ? '다른 리뷰·기사에도 비슷한 평가가 있음 | 비슷한 평가를 찾지 못함 | 확인 불가'
+                  : '사실과 일치 | 사실과 다름 | 확인 불가';
+              return [
+                `[CLAIM ${idx + 1}]`,
+                `판정: (${allowedVerdicts} 중 정확히 하나만 적기)`,
+                '이유: (검색된 자료를 바탕으로 판정 이유를 중학생도 이해할 수 있는 쉬운 한국어 한 문장으로 적기. 자료를 못 찾았으면: 확인된 자료 없음)',
+                '출처날짜: (검색으로 확인한 출처들의 작성·수정일. 예: 2026-10-15 | 2025-03-01, 날짜를 알 수 없으면: 날짜 미상)',
+                `[/CLAIM ${idx + 1}]`,
+              ].join('\n');
+            })
             .join('\n\n'),
-          '내용 작성 원칙:',
-          '1. 각 주장마다 반드시 Google 검색으로 찾은 객관적 사실·수치·출처 설명만 "검색된 자료에 따르면 ..." 형식으로 2~3문장 쉽게 작성하세요.',
-          '2. 절대 "사실입니다", "거짓입니다", "참입니다", "허위입니다", "가짜입니다", "맞습니다", "틀렸습니다"처럼 참·거짓을 단정하는 표현을 쓰지 마세요.',
-          '3. 특정 주장을 뒷받침하거나 대조할 신뢰할 만한 검색 자료를 찾지 못했으면 억지로 지어내지 말고 해당 블록 안에 정확히 "확인된 자료 없음"이라고만 적으세요.',
+          '판정 원칙:',
+          '1. [사실 주장]은 검색된 최신 자료와 비교해 반드시 "사실과 일치", "사실과 다름", "확인 불가" 중 하나로 판정하세요.',
+          '2. [의견 주장]은 다른 최신 리뷰·기사를 찾아보고 "다른 리뷰·기사에도 비슷한 평가가 있음", "비슷한 평가를 찾지 못함", 또는 자료가 전혀 없으면 "확인 불가"로 표시하세요.',
+          '3. 검색 자료를 찾지 못했거나 근거가 불충분하면 추측하지 말고 반드시 판정을 "확인 불가"로 적고 이유에 "확인된 자료 없음"을 적어 주세요.',
+          '4. 오래된 기억이 아니라 방금 검색한 최신 웹 자료와 출처 날짜를 기준으로 판단하세요.',
         ]
           .filter(Boolean)
           .join('\n\n');
@@ -1707,8 +1956,7 @@ async function startServer() {
             model: modelName,
             contents: factPrompt,
             config: {
-              systemInstruction:
-                '당신은 Google 검색 자료를 바탕으로 사실 확인 참고 정보를 정리하는 도우미입니다. 중학생도 이해하기 쉬운 한국어를 사용하고, 참·거짓을 단정하지 않으며, 자료가 없는 주장은 반드시 "확인된 자료 없음"으로 표시합니다.',
+              systemInstruction: `${todayDateInstruction}\n\n당신은 Google 검색 최신 자료를 바탕으로 주장을 대조·판정하는 팩트체크 도우미입니다. 검색 시 제품명·사건명과 올해 연도(${currentYear}년)를 포함해 최신 자료를 우선 찾고, 근거가 없으면 반드시 "확인 불가"로 표시하세요. 중학생도 이해하기 쉬운 한국어 한 문장으로 이유를 적으세요.`,
               tools: [{ googleSearch: {} }],
               thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
               abortSignal: serverAbortController.signal,
@@ -1741,12 +1989,22 @@ async function startServer() {
             }
           }
 
+          const responseText = searchResponse.text?.trim();
+          if (!responseText) {
+            return claims.map((claimItem) => ({
+              claimId: claimItem.id,
+              claim: claimItem.claim,
+              claimType: claimItem.claimType === 'opinion' ? 'opinion' : 'fact',
+              status: 'search_error',
+              verdict: '확인 불가',
+              summary: '검색 중 오류가 났어요',
+              sources: [],
+              searchQueries: [],
+            }));
+          }
+
           const groundingMeta = searchResponse.candidates?.[0]?.groundingMetadata;
-          return parseMultiClaimFactCheckResponse(
-            claims,
-            searchResponse.text || '',
-            groundingMeta
-          );
+          return parseMultiClaimFactCheckResponse(claims, responseText, groundingMeta);
         } catch (err) {
           if (serverAbortController.signal.aborted || isAbortLikeError(err)) {
             throw err;
@@ -1754,14 +2012,17 @@ async function startServer() {
           return claims.map((claimItem) => ({
             claimId: claimItem.id,
             claim: claimItem.claim,
-            status: 'not_found',
-            summary: '확인된 자료 없음',
+            claimType: claimItem.claimType === 'opinion' ? 'opinion' : 'fact',
+            status: 'search_error',
+            verdict: '확인 불가',
+            summary: '검색 중 오류가 났어요',
             sources: [],
             searchQueries: [],
           }));
         }
       };
 
+      emitStageProgress('fact_checking');
       const checkedClaimResults = await runFactCheckBatchWithGoogleSearch(claimsToFactCheck);
       const factCheck: FactCheckReport = buildFactCheckReport(
         checkedClaimResults,
@@ -1772,17 +2033,152 @@ async function startServer() {
         return;
       }
 
-      return res.json({
+      emitStageProgress('summarizing');
+
+      // Call D: Rewrite overallSummary ('전체 설명') and all 3 lines of threeLineSummary
+      // reflecting the Google Search fact-check verdicts and latest search findings.
+      let reorganizedByLatestSearch = false;
+      const hasAnyNonErrorSearch =
+        checkedClaimResults.length > 0 &&
+        (factCheck.searchErrorCount ?? 0) < checkedClaimResults.length;
+
+      if (hasAnyNonErrorSearch) {
+        const synthesisSchema = {
+          type: Type.OBJECT,
+          properties: {
+            overallSummary: {
+              type: Type.STRING,
+              description:
+                '검색 판정 결과를 반영해 중학생도 이해하기 쉽게 다시 쓴 전체 설명 (2~3문장).',
+            },
+            whatItIs: {
+              type: Type.STRING,
+              description:
+                '검색 결과를 반영한 3줄 요약 1번: 무슨 영상인지 (1~2문장, 쉬운 일상 말로).',
+            },
+            watchOutFor: {
+              type: Type.STRING,
+              description:
+                '검색 판정 결과(사실과 다름·확인 불가·오래된 자료·과장 표현 등)를 반영한 3줄 요약 2번: 주의할 점 (1~2문장).',
+            },
+            howToVerify: {
+              type: Type.STRING,
+              description:
+                '검색 결과를 반영한 3줄 요약 3번: 이렇게 확인해 보세요 (1~2문장).',
+            },
+            differsFromInitialAnalysis: {
+              type: Type.BOOLEAN,
+              description:
+                '검색된 최신 자료 내용이 1차 분석의 내용·전제·인물/제품/사건 현황과 다르거나 검색 판정 결과를 반영해 수정·정리되었으면 true, 1차 분석과 같으면 false.',
+            },
+          },
+          required: [
+            'overallSummary',
+            'whatItIs',
+            'watchOutFor',
+            'howToVerify',
+            'differsFromInitialAnalysis',
+          ],
+        };
+
+        const searchFactsBlock = checkedClaimResults
+          .map((item, idx) => {
+            const typeText = item.claimType === 'opinion' ? '의견 주장' : '사실 주장';
+            const sourceList =
+              item.sources.length > 0
+                ? `\n   출처: ${item.sources
+                    .map(
+                      (s) =>
+                        `${s.title} (${s.publishedDate || '날짜 미상'}${
+                          s.isOutdated ? ', 오래된 자료' : ''
+                        })`
+                    )
+                    .join(', ')}`
+                : '';
+            return `${idx + 1}. [${typeText}] 주장: ${item.claim}\n   판정: ${
+              item.verdict || '확인 불가'
+            }\n   이유/상태: ${item.summary}${sourceList}`;
+          })
+          .join('\n');
+
+        const synthesisPrompt = [
+          '아래 1차 내용 분석 결과와 방금 Google 검색으로 확인한 사실 확인 판정을 통합해, "전체 설명(overallSummary)"과 3줄 요약(whatItIs, watchOutFor, howToVerify)을 검색 결과를 반영해 다시 써 주세요.',
+          `[코드로 정해진 종합 판정]\n${factCheck.overallVerdict}`,
+          `[1차 분석 전체 설명]\n${finalOverallSummary || '(없음)'}`,
+          `[1차 분석 3줄 요약]\n1. 무슨 영상인지: ${threeLineSummary.whatItIs}\n2. 주의할 점: ${threeLineSummary.watchOutFor}\n3. 이렇게 확인해 보세요: ${threeLineSummary.howToVerify}`,
+          `[Google 검색 사실 확인 결과]\n${searchFactsBlock}`,
+          '규칙:',
+          '1. 검색 자료와 1차 분석의 시점 가정이나 내용이 다르면 반드시 검색 자료를 우선해 다시 작성하고 differsFromInitialAnalysis를 true로 설정하세요.',
+          '2. "사실과 다름"으로 판정된 주장이 있으면 전체 설명과 2줄 요약(주의할 점)에 어떤 부분이 검색 자료와 달랐는지 중학생도 이해하기 쉽게 꼭 적으세요.',
+          '3. 출처가 "오래된 자료"이거나 "확인 불가"인 항목이 있으면 그 점도 주의할 점·확인 방법에 반영하세요.',
+        ].join('\n\n');
+
+        try {
+          const synthesisRes = await generateWithRetry(
+            () =>
+              ai.models.generateContent({
+                model: 'gemini-4-hydrogen',
+                contents: synthesisPrompt,
+                config: {
+                  systemInstruction: `${todayDateInstruction}\n\n당신은 1차 콘텐츠 구조 분석과 Google 검색 팩트체크 판정 결과를 통합해 전체 설명과 3줄 요약을 정리하는 도우미입니다. 최신 검색 자료가 1차 분석 내용과 다르면 항상 검색 자료를 우선합니다.`,
+                  responseMimeType: 'application/json',
+                  responseSchema: synthesisSchema,
+                  thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                  abortSignal: serverAbortController.signal,
+                },
+              }),
+            1,
+            serverAbortController.signal
+          );
+          const synthesisText = synthesisRes.text?.trim();
+          if (synthesisText) {
+            const synthesisParsed = JSON.parse(synthesisText) as {
+              overallSummary?: string;
+              whatItIs?: string;
+              watchOutFor?: string;
+              howToVerify?: string;
+              differsFromInitialAnalysis?: boolean;
+            };
+            if (synthesisParsed.overallSummary?.trim()) {
+              finalOverallSummary = synthesisParsed.overallSummary.trim();
+            }
+            if (synthesisParsed.whatItIs?.trim()) {
+              threeLineSummary.whatItIs = synthesisParsed.whatItIs.trim();
+            }
+            if (synthesisParsed.watchOutFor?.trim()) {
+              threeLineSummary.watchOutFor = synthesisParsed.watchOutFor.trim();
+            }
+            if (synthesisParsed.howToVerify?.trim()) {
+              threeLineSummary.howToVerify = synthesisParsed.howToVerify.trim();
+            }
+            reorganizedByLatestSearch = Boolean(synthesisParsed.differsFromInitialAnalysis);
+          }
+        } catch (synthErr) {
+          if (serverAbortController.signal.aborted || isAbortLikeError(synthErr)) {
+            throw synthErr;
+          }
+          // Soft-fallback: keep sanitized Call A summaries if synthesis fails
+        }
+      }
+
+      if (serverAbortController.signal.aborted || res.writableEnded) {
+        return;
+      }
+
+      return sendSuccessResponse({
         contentTitle: resolvedTitle,
         analyzedVideoInfo,
-        inputSummary: parsed.inputSummary || '',
+        inputSummary: sanitizeInitialAnalysisText(parsed.inputSummary || ''),
         extractedImageText: parsed.extractedImageText || '',
         reliabilityScore,
         scoreBreakdown,
         aiSuspicion,
         factCheck,
+        reorganizedByLatestSearch,
+        c2paMetadata: clientC2paMetadata,
+        compressionSummary: clientCompressionSummary,
         overallStatus,
-        overallSummary: parsed.overallSummary || '',
+        overallSummary: finalOverallSummary,
         threeLineSummary,
         disclaimer:
           '이 점수와 분석은 사실일 확률이 아니라, 믿을 만한 콘텐츠가 갖추는 요소를 얼마나 갖췄는지 보여주는 참고 정보예요.',
@@ -1805,7 +2201,7 @@ async function startServer() {
       if (classified.isAborted) {
         return;
       }
-      return res.status(classified.status).json({ error: classified.error });
+      return sendErrorResponse(classified.status, classified.error);
     } finally {
       res.off('close', handleClientClose);
       if (localUploadedFilePath) {

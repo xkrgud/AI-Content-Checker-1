@@ -1,48 +1,58 @@
-import React, { useEffect, useState } from 'react';
-import { CheckCircle2, Loader2 } from 'lucide-react';
+import React from 'react';
+import { CheckCircle2, Clock, Loader2 } from 'lucide-react';
+import type { AnalysisStageId } from '../types/analysis';
+import { formatEstimatedRemainingMessage } from '../utils/durationEstimator';
 
 interface AnalysisProgressProps {
   contentLabel: string;
+  currentStage: AnalysisStageId;
+  remainingSeconds: number;
   onCancel: () => void;
 }
 
-const PIPELINE_STEPS = [
+const PIPELINE_STEPS: Array<{
+  id: AnalysisStageId;
+  title: string;
+  description: string;
+}> = [
   {
-    id: 'claims',
-    title: '01. 핵심 주장 및 수치 추출',
-    description: '콘텐츠의 중심 내용과 구체적 수치·사실 주장을 항목별로 분리합니다.',
+    id: 'loading_video',
+    title: '01. 영상 불러오기',
+    description: '영상 링크 정보 또는 업로드된 영상 파일과 기본 정보를 준비합니다.',
   },
   {
-    id: 'exaggeration',
-    title: '02. 과장 및 오해 유발 표현 분석',
-    description: '근거 없는 확신, 공포·불안 조장, 광고·홍보성 문구를 점검합니다.',
+    id: 'analyzing_content',
+    title: '02. 내용 분석',
+    description: '핵심 주장·수치·근거 구조 정리와 AI 생성 단서 점검을 동시에 진행합니다.',
   },
   {
-    id: 'sources',
-    title: '03. 출처 및 근거 확인 필요성 검토',
-    description: '통계·연구 확인이 필요한 부분과 직접 검색할 키워드를 정리합니다.',
+    id: 'detecting_ai',
+    title: '03. AI 생성 판별',
+    description: '영상 프레임과 소리, 메타데이터에서 AI 생성·합성 단서를 점검합니다.',
   },
   {
-    id: 'ai-gen',
-    title: '04. AI 생성 가능성 및 한계 평가',
-    description: '합성·생성 가능성에 관한 시각적·맥락적 단서와 판별 불확실성을 안내합니다.',
+    id: 'fact_checking',
+    title: '04. 사실 확인',
+    description: '추출된 핵심 주장(최대 3개)을 Google 검색으로 찾아 실제 자료와 대조합니다.',
   },
   {
-    id: 'fact-check',
-    title: '05. 핵심 주장 Google 검색 자료 확인',
-    description: '추출된 핵심 주장(최대 3개)에 대해 Google 검색으로 실제 자료와 출처를 대조합니다.',
+    id: 'summarizing',
+    title: '05. 결과 정리',
+    description: '검색 결과를 반영해 전체 설명, 주의할 점, 신뢰성 점수를 최종 정리합니다.',
   },
 ];
 
-export const AnalysisProgress: React.FC<AnalysisProgressProps> = ({ contentLabel, onCancel }) => {
-  const [activeIndex, setActiveIndex] = useState(0);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      setActiveIndex((prev) => (prev < PIPELINE_STEPS.length - 1 ? prev + 1 : prev));
-    }, 1100);
-    return () => window.clearInterval(timer);
-  }, []);
+export const AnalysisProgress: React.FC<AnalysisProgressProps> = ({
+  contentLabel,
+  currentStage,
+  remainingSeconds,
+  onCancel,
+}) => {
+  const activeIndex = Math.max(
+    0,
+    PIPELINE_STEPS.findIndex((step) => step.id === currentStage)
+  );
+  const etaText = formatEstimatedRemainingMessage(remainingSeconds);
 
   return (
     <div className="mx-auto max-w-3xl px-4 py-12 sm:px-6">
@@ -51,9 +61,18 @@ export const AnalysisProgress: React.FC<AnalysisProgressProps> = ({ contentLabel
         className="rounded-2xl border border-slate-200 bg-white p-6 sm:p-8"
       >
         <div className="flex items-start justify-between gap-4">
-          <div>
-            <p className="text-xs font-medium text-blue-700">AI 신뢰도 분석 진행 중</p>
-            <h2 className="mt-1.5 text-xl font-bold text-slate-950 sm:text-2xl">
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <p className="text-xs font-medium text-blue-700">AI 신뢰도 분석 진행 중</p>
+              <span
+                data-testid="estimated-remaining-time"
+                className="inline-flex items-center gap-1.5 rounded-md border border-blue-200 bg-blue-50 px-2.5 py-0.5 text-xs font-semibold text-blue-900 font-mono tabular-nums"
+              >
+                <Clock className="h-3.5 w-3.5 text-blue-700 shrink-0" aria-hidden="true" />
+                {etaText}
+              </span>
+            </div>
+            <h2 className="mt-2 text-xl font-bold text-slate-950 sm:text-2xl">
               콘텐츠의 주장과 근거 구조를 점검하고 있습니다
             </h2>
             <p className="mt-1 text-sm text-slate-600 truncate max-w-xl">{contentLabel}</p>
@@ -69,6 +88,8 @@ export const AnalysisProgress: React.FC<AnalysisProgressProps> = ({ contentLabel
             return (
               <li
                 key={step.id}
+                data-stage-id={step.id}
+                data-stage-status={isCompleted ? 'completed' : isCurrent ? 'current' : 'pending'}
                 className={`flex items-start gap-3.5 rounded-xl border p-4 transition-colors ${
                   isCurrent
                     ? 'border-blue-200 bg-blue-50/70'

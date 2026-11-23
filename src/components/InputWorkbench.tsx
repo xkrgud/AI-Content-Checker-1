@@ -10,13 +10,14 @@ import {
   Upload,
   X,
 } from 'lucide-react';
-import type { UrlInspectionResult } from '../types/analysis';
+import type {
+  C2paMetadataSummary,
+  UrlInspectionResult,
+  VideoCompressionSummary,
+} from '../types/analysis';
+import { readSafeJsonResponse } from '../utils/httpResponse';
 import { getPlatformLabel, isInstagramUrl, validateAndNormalizeUrl } from '../utils/urlParser';
-import {
-  formatFileSizeLabel,
-  shouldUseGeminiFileApi,
-  validateVideoFileMeta,
-} from '../utils/videoUpload';
+import { formatFileSizeLabel, validateVideoFileMeta } from '../utils/videoUpload';
 
 interface InputWorkbenchProps {
   urlInput: string;
@@ -26,7 +27,13 @@ interface InputWorkbenchProps {
   transcriptInput: string;
   onChangeTranscriptInput: (value: string) => void;
   uploadedVideoFile: File | null;
-  onChangeUploadedVideoFile: (file: File | null) => void;
+  onSelectVideoFile: (file: File | null) => void;
+  isCompressingVideo?: boolean;
+  compressionProgress?: number;
+  compressingFileName?: string | null;
+  compressionSummary?: VideoCompressionSummary | null;
+  c2paMetadata?: C2paMetadataSummary | null;
+  onCancelCompression?: () => void;
   inspectionResult: UrlInspectionResult | null;
   onSetInspectionResult: (res: UrlInspectionResult | null) => void;
   sharedNotice: string | null;
@@ -45,7 +52,13 @@ export const InputWorkbench: React.FC<InputWorkbenchProps> = ({
   transcriptInput,
   onChangeTranscriptInput,
   uploadedVideoFile,
-  onChangeUploadedVideoFile,
+  onSelectVideoFile,
+  isCompressingVideo = false,
+  compressionProgress = 0,
+  compressingFileName = null,
+  compressionSummary = null,
+  c2paMetadata = null,
+  onCancelCompression,
   inspectionResult,
   onSetInspectionResult,
   sharedNotice,
@@ -62,7 +75,8 @@ export const InputWorkbench: React.FC<InputWorkbenchProps> = ({
 
   const isInstagramLink =
     isInstagramUrl(urlInput) || inspectionResult?.platform === 'instagram';
-  const showInlineVideoUpload = isInstagramLink || Boolean(uploadedVideoFile);
+  const showInlineVideoUpload =
+    isInstagramLink || Boolean(uploadedVideoFile) || isCompressingVideo;
 
   const handleSelectVideoFile = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = e.target.files?.[0] ?? null;
@@ -71,7 +85,7 @@ export const InputWorkbench: React.FC<InputWorkbenchProps> = ({
     const validation = validateVideoFileMeta(selected);
     if (!validation.valid) {
       setFileError(validation.error || '지원되는 영상 파일(mp4, mov)을 선택해 주세요.');
-      onChangeUploadedVideoFile(null);
+      onSelectVideoFile(null);
       e.target.value = '';
       return;
     }
@@ -79,12 +93,14 @@ export const InputWorkbench: React.FC<InputWorkbenchProps> = ({
     setFileError(null);
     setUrlError(null);
     onClearError();
-    onChangeUploadedVideoFile(selected);
+    onSelectVideoFile(selected);
+    e.target.value = '';
   };
 
   const handleRemoveUploadedVideo = () => {
     setFileError(null);
-    onChangeUploadedVideoFile(null);
+    onCancelCompression?.();
+    onSelectVideoFile(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -109,14 +125,14 @@ export const InputWorkbench: React.FC<InputWorkbenchProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: validation.normalizedUrl }),
       });
-      const data = await response.json();
-      if (!response.ok) {
-        setUrlError(data.error || '링크 정보를 확인하지 못했습니다.');
+      const parsed = await readSafeJsonResponse<UrlInspectionResult>(response, 'inspect');
+      if (!parsed.ok) {
+        setUrlError(parsed.error);
         onSetInspectionResult(null);
         return;
       }
 
-      const inspected = data as UrlInspectionResult;
+      const inspected = parsed.data;
       onSetInspectionResult(inspected);
       onChangeUrlInput(inspected.normalizedUrl);
 
@@ -151,8 +167,8 @@ export const InputWorkbench: React.FC<InputWorkbenchProps> = ({
           영상의 주장과 근거를 스스로 판단할 수 있게 분석합니다
         </h1>
         <p className="mt-3 text-base leading-relaxed text-slate-600">
-          콘텐츠의 참·거짓을 단정하지 않습니다. 어떤 영상·내용인지 요약하고, 핵심 주장과 수치,
-          과장 표현, 출처 필요성, AI 신뢰성 체크리스트 점검 결과까지 한 번에 정리해 드립니다.
+          영상·내용의 핵심 주장을 사실 주장과 의견 주장으로 나누어 정리하고, 최신 Google 검색
+          자료 대조 판정과 AI 생성 의심도 점검 결과까지 한 번에 보여 드립니다.
         </p>
       </div>
 
@@ -298,29 +314,84 @@ export const InputWorkbench: React.FC<InputWorkbenchProps> = ({
                 <div className="flex flex-wrap items-center gap-2.5">
                   <label
                     htmlFor="reel-video-upload-input"
-                    className="inline-flex items-center justify-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-900 transition-colors hover:bg-slate-100 whitespace-nowrap shrink-0 cursor-pointer"
+                    className={`inline-flex items-center justify-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-900 transition-colors hover:bg-slate-100 whitespace-nowrap shrink-0 ${
+                      isCompressingVideo || isAnalyzing
+                        ? 'pointer-events-none opacity-60'
+                        : 'cursor-pointer'
+                    }`}
                   >
                     <Upload className="h-4 w-4 text-blue-700" aria-hidden="true" />
                     {uploadedVideoFile ? '다른 영상 선택 (mp4, mov)' : '영상 올리기 (mp4, mov)'}
                   </label>
                   <span className="text-xs text-slate-600">
-                    100MB 미만은 바로 전송, 100MB 이상은 File API로 안전하게 처리돼요
+                    30MB가 넘으면 자동으로 줄여서 올려요 (원본 최대 300MB · 3분)
                   </span>
                 </div>
               </div>
 
-              {uploadedVideoFile && (
-                <div className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-xs">
-                  <div className="min-w-0 flex-1 space-y-0.5">
+              {isCompressingVideo && (
+                <div
+                  data-testid="video-compression-progress"
+                  role="status"
+                  aria-live="polite"
+                  className="rounded-lg border border-blue-200 bg-white px-4 py-3 text-xs space-y-2"
+                >
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <Loader2
+                        className="h-4 w-4 animate-spin text-blue-700 shrink-0"
+                        aria-hidden="true"
+                      />
+                      <span className="font-semibold text-slate-900 truncate">
+                        영상 크기를 줄이는 중이에요 {compressionProgress}%
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleRemoveUploadedVideo}
+                      className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs font-medium text-slate-700 hover:bg-slate-100 whitespace-nowrap shrink-0 cursor-pointer"
+                    >
+                      취소
+                    </button>
+                  </div>
+                  {compressingFileName && (
+                    <p className="text-[11px] text-slate-500 truncate">{compressingFileName}</p>
+                  )}
+                  <progress
+                    value={compressionProgress}
+                    max={100}
+                    aria-label="영상 크기 축소 진행률"
+                    className="h-2 w-full overflow-hidden rounded-full accent-blue-700"
+                  />
+                </div>
+              )}
+
+              {uploadedVideoFile && !isCompressingVideo && (
+                <div
+                  data-testid="uploaded-video-summary"
+                  className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-xs"
+                >
+                  <div className="min-w-0 flex-1 space-y-1">
                     <p className="font-semibold text-slate-900 truncate">
                       선택된 영상: {uploadedVideoFile.name}
                     </p>
-                    <p className="text-slate-500 font-mono tabular-nums">
-                      {formatFileSizeLabel(uploadedVideoFile.size)} ·{' '}
-                      {shouldUseGeminiFileApi(uploadedVideoFile.size)
-                        ? '대용량 File API 업로드 대상 (100MB 이상)'
-                        : '직접 전송 (100MB 미만)'}
-                    </p>
+                    {compressionSummary?.wasCompressed ? (
+                      <p className="text-slate-700 font-mono tabular-nums">
+                        원본 크기 {formatFileSizeLabel(compressionSummary.originalSizeBytes)} → 줄인 크기{' '}
+                        {formatFileSizeLabel(compressionSummary.compressedSizeBytes)}
+                      </p>
+                    ) : (
+                      <p className="text-slate-500 font-mono tabular-nums">
+                        {formatFileSizeLabel(uploadedVideoFile.size)} · 바로 업로드 (28MB 이하)
+                      </p>
+                    )}
+                    {c2paMetadata?.hasManifest && (
+                      <p className="text-[11px] text-blue-900">
+                        원본 C2PA 출처 정보 확인됨
+                        {c2paMetadata.claimGenerator ? ` (${c2paMetadata.claimGenerator})` : ''}
+                        {c2paMetadata.isAiGeneratedClaim ? ' · AI 생성 표기 포함' : ''}
+                      </p>
+                    )}
                   </div>
                   <button
                     type="button"
@@ -426,10 +497,15 @@ export const InputWorkbench: React.FC<InputWorkbenchProps> = ({
             </p>
             <button
               type="submit"
-              disabled={isAnalyzing}
+              disabled={isAnalyzing || isCompressingVideo}
               className="inline-flex items-center justify-center gap-2 rounded-lg bg-blue-700 px-6 py-3 text-sm font-semibold text-white transition-colors hover:bg-blue-800 disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-700"
             >
-              {isAnalyzing ? (
+              {isCompressingVideo ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                  영상 크기 줄이는 중 ({compressionProgress}%)
+                </>
+              ) : isAnalyzing ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
                   분석 진행 중

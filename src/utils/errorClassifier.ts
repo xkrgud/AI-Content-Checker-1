@@ -56,21 +56,6 @@ export function classifyAnalyzeError(
     };
   }
 
-  // Distinguish missing/unsupported Gemini model errors BEFORE checking video fetch errors
-  const looksLikeModelError =
-    /models\/[a-z0-9._-]+/i.test(msg) ||
-    /\bmodel\b.*(not found|invalid|unsupported|unavailable|deprecated|does not exist)/i.test(msg) ||
-    /(not found|unsupported|deprecated).*\bmodel\b/i.test(msg) ||
-    (statusCode === 404 && !/video|youtube|fileUri|fileData/i.test(msg));
-
-  if (looksLikeModelError) {
-    return {
-      status: 502,
-      error:
-        '설정한 AI 분석 모델을 찾을 수 없거나 현재 사용할 수 없습니다. 모델 이름과 지원 상태를 확인해 주세요.',
-    };
-  }
-
   if (
     statusCode === 503 ||
     /503|UNAVAILABLE|high demand|overloaded|Service Unavailable/i.test(msg)
@@ -79,6 +64,26 @@ export function classifyAnalyzeError(
       status: 503,
       error:
         'AI 분석 모델에 일시적으로 요청이 몰리고 있습니다. 잠시 후 다시 시도해 주세요.',
+    };
+  }
+
+  // Distinguish missing/unsupported Gemini model errors BEFORE checking video fetch errors
+  const looksLikeModelError =
+    (/models\/[a-z0-9._-]+/i.test(msg) &&
+      /(not found|invalid|unsupported|unavailable|deprecated|does not exist|not supported|NOT_FOUND)/i.test(
+        msg
+      )) ||
+    /\bmodel\b.*(not found|invalid|unsupported|unavailable|deprecated|does not exist|not supported)/i.test(
+      msg
+    ) ||
+    /(not found|unsupported|deprecated).*\bmodel\b/i.test(msg) ||
+    (statusCode === 404 && !/video|youtube|fileUri|fileData/i.test(msg));
+
+  if (looksLikeModelError) {
+    return {
+      status: 502,
+      error:
+        '설정한 AI 분석 모델을 찾을 수 없거나 현재 사용할 수 없습니다. 모델 이름과 지원 상태를 확인해 주세요.',
     };
   }
 

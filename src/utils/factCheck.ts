@@ -1,21 +1,59 @@
 import type {
   ClaimFactCheck,
+  ClaimFactCheckVerdict,
+  ClaimType,
   CoreClaim,
   FactCheckReport,
   FactCheckSource,
   FactCheckStatus,
+  FactClaimVerdict,
+  OpinionClaimVerdict,
+  OverallFactCheckVerdict,
 } from '../types/analysis.ts';
 
 export const MAX_FACT_CHECK_CLAIMS = 3;
+
+export function buildTodayDateInstruction(now: Date = new Date()): string {
+  const year = now.getFullYear();
+  const month = now.getMonth() + 1;
+  const day = now.getDate();
+  const iso = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  return `오늘 날짜는 ${year}년 ${month}월 ${day}일(${iso})입니다. 너의 지식은 오래됐을 수 있으니 최근 사건·제품·인물의 현재 상황을 기억으로 판단하지 마.`;
+}
+
+const CALL_A_FORBIDDEN_PHRASES: Array<[RegExp, string]> = [
+  [/명백한\s*잘못된\s*정보(?:입니다|이에요)?/g, '추가 확인이 필요한 정보'],
+  [/잘못된\s*정보(?:입니다|이에요)?/g, '사실 확인이 필요한 주장'],
+  [/명백한\s*허위\s*사실(?:입니다|이에요)?/g, '사실 확인이 필요한 주장'],
+  [/허위\s*사실(?:입니다|이에요)?/g, '확인이 필요한 주장'],
+  [/사실이\s*아닙니다/g, '공식 자료로 확인이 필요합니다'],
+  [/사실이\s*아니에요/g, '공식 자료로 확인이 필요해요'],
+  [/사실이\s*아닌/g, '확인되지 않은'],
+  [/사실이\s*아님/g, '확인 필요'],
+  [/거짓\s*정보(?:입니다|이에요)?/g, '확인이 필요한 주장'],
+];
+
+export function sanitizeInitialAnalysisText(rawText: string): string {
+  if (!rawText || typeof rawText !== 'string') return '';
+  let result = rawText;
+  for (const [pattern, replacement] of CALL_A_FORBIDDEN_PHRASES) {
+    result = result.replace(pattern, replacement);
+  }
+  return result.replace(/\s+/g, ' ').trim();
+}
 
 export function selectClaimsForFactCheck(coreClaims: CoreClaim[]): {
   toCheck: CoreClaim[];
   remaining: CoreClaim[];
 } {
   const validClaims = coreClaims.filter((c) => Boolean(c?.claim?.trim()));
+  const factClaims = validClaims.filter((c) => c.claimType !== 'opinion');
+  const opinionClaims = validClaims.filter((c) => c.claimType === 'opinion');
+  const prioritized = [...factClaims, ...opinionClaims];
+
   return {
-    toCheck: validClaims.slice(0, MAX_FACT_CHECK_CLAIMS),
-    remaining: validClaims.slice(MAX_FACT_CHECK_CLAIMS),
+    toCheck: prioritized.slice(0, MAX_FACT_CHECK_CLAIMS),
+    remaining: prioritized.slice(MAX_FACT_CHECK_CLAIMS),
   };
 }
 
@@ -29,6 +67,144 @@ export function isSafeHttpUrl(rawUrl?: string): boolean {
   }
 }
 
+export function utf8ByteOffsetToCharIndex(text: string, byteOffset: number): number {
+  if (!text || byteOffset <= 0) return 0;
+
+  let accumulatedBytes = 0;
+  let charIndex = 0;
+
+  while (charIndex < text.length) {
+    if (accumulatedBytes >= byteOffset) {
+      return charIndex;
+    }
+
+    const codePoint = text.codePointAt(charIndex);
+    if (codePoint === undefined) break;
+
+    let cpBytes = 1;
+    if (codePoint <= 0x7f) {
+      cpBytes = 1;
+    } else if (codePoint <= 0x7ff) {
+      cpBytes = 2;
+    } else if (codePoint <= 0xffff) {
+      cpBytes = 3;
+    } else {
+      cpBytes = 4;
+    }
+
+    const charStep = codePoint > 0xffff ? 2 : 1;
+    if (accumulatedBytes + cpBytes > byteOffset) {
+      return charIndex;
+    }
+
+    accumulatedBytes += cpBytes;
+    charIndex += charStep;
+  }
+
+  return text.length;
+}
+
+export function utf8ByteRangeToCharRange(
+  text: string,
+  byteStart: number,
+  byteEnd: number
+): { start: number; end: number } {
+  const start = utf8ByteOffsetToCharIndex(text, Math.max(0, byteStart));
+  const end = utf8ByteOffsetToCharIndex(text, Math.max(byteStart, byteEnd));
+  return { start, end: Math.max(start, end) };
+}
+
+export function normalizePublishedDate(raw?: string): string | undefined {
+  if (!raw || typeof raw !== 'string') return undefined;
+  const text = raw.trim();
+  if (!text || /날짜\s*미상|미상|알\s*수\s*없|unknown/i.test(text)) {
+    return undefined;
+  }
+
+  const fullIsoMatch = text.match(/((?:19|20)\d{2})[-./](\d{1,2})[-./](\d{1,2})/);
+  if (fullIsoMatch) {
+    const y = Number(fullIsoMatch[1]);
+    const m = Number(fullIsoMatch[2]);
+    const d = Number(fullIsoMatch[3]);
+    if (m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+      return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    }
+  }
+
+  const krFullMatch = text.match(/((?:19|20)\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일/);
+  if (krFullMatch) {
+    const y = Number(krFullMatch[1]);
+    const m = Number(krFullMatch[2]);
+    const d = Number(krFullMatch[3]);
+    if (m >= 1 && m <= 12 && d >= 1 && d <= 31) {
+      return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    }
+  }
+
+  const compactYmdMatch = text.match(/(?:^|[^\d])((?:19|20)\d{2})(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?:[^\d]|$)/);
+  if (compactYmdMatch) {
+    return `${compactYmdMatch[1]}-${compactYmdMatch[2]}-${compactYmdMatch[3]}`;
+  }
+
+  const ymMatch = text.match(/((?:19|20)\d{2})[-./](\d{1,2})(?!\d)/);
+  if (ymMatch) {
+    const y = Number(ymMatch[1]);
+    const m = Number(ymMatch[2]);
+    if (m >= 1 && m <= 12) {
+      return `${y}-${String(m).padStart(2, '0')}`;
+    }
+  }
+
+  const krYmMatch = text.match(/((?:19|20)\d{2})\s*년\s*(\d{1,2})\s*월/);
+  if (krYmMatch) {
+    const y = Number(krYmMatch[1]);
+    const m = Number(krYmMatch[2]);
+    if (m >= 1 && m <= 12) {
+      return `${y}-${String(m).padStart(2, '0')}`;
+    }
+  }
+
+  const yearMatch = text.match(/\b((?:19|20)\d{2})\b/);
+  if (yearMatch) {
+    return yearMatch[1];
+  }
+
+  return undefined;
+}
+
+export function extractDateFromTextOrUrl(title?: string, url?: string): string | undefined {
+  return normalizePublishedDate(title) ?? normalizePublishedDate(url);
+}
+
+export function isSourceOlderThanOneYear(
+  publishedDate?: string,
+  now: Date = new Date()
+): boolean {
+  const normalized = normalizePublishedDate(publishedDate);
+  if (!normalized) return false;
+
+  const oneYearAgoMs = Date.UTC(now.getFullYear() - 1, now.getMonth(), now.getDate());
+  const ymd = normalized.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (ymd) {
+    const srcMs = Date.UTC(Number(ymd[1]), Number(ymd[2]) - 1, Number(ymd[3]));
+    return srcMs < oneYearAgoMs;
+  }
+
+  const ym = normalized.match(/^(\d{4})-(\d{2})$/);
+  if (ym) {
+    const y = Number(ym[1]);
+    const m = Number(ym[2]);
+    return y < now.getFullYear() - 1 || (y === now.getFullYear() - 1 && m < now.getMonth() + 1);
+  }
+
+  const yOnly = normalized.match(/^(\d{4})$/);
+  if (yOnly) {
+    return Number(yOnly[1]) < now.getFullYear() - 1;
+  }
+
+  return false;
+}
+
 export function extractGroundingWebSources(
   groundingChunks?: Array<{
     web?: {
@@ -37,7 +213,9 @@ export function extractGroundingWebSources(
       domain?: string;
     };
   }>,
-  maxSources = 5
+  maxSources = 5,
+  sourceDates: Array<string | undefined> = [],
+  now: Date = new Date()
 ): FactCheckSource[] {
   if (!Array.isArray(groundingChunks)) return [];
 
@@ -60,8 +238,18 @@ export function extractGroundingWebSources(
     }
 
     const title = chunk?.web?.title?.trim() || fallbackTitle;
+    const explicitDate = normalizePublishedDate(sourceDates[sources.length]);
+    const inferredDate = explicitDate ?? extractDateFromTextOrUrl(title, rawUri);
+    const publishedDate = inferredDate ?? '날짜 미상';
+    const isOutdated = inferredDate ? isSourceOlderThanOneYear(inferredDate, now) : false;
+
     seenUrls.add(rawUri);
-    sources.push({ title, url: rawUri });
+    sources.push({
+      title,
+      url: rawUri,
+      publishedDate,
+      isOutdated,
+    });
 
     if (sources.length >= maxSources) {
       break;
@@ -132,17 +320,121 @@ export function sanitizeNonJudgmentalFactSummary(
   };
 }
 
+function normalizeFactVerdict(raw?: string): FactClaimVerdict {
+  const text = (raw || '').replace(/\s+/g, ' ').trim();
+  if (/사실과\s*다름|일치하지\s*않|틀림|다릅니다/.test(text)) {
+    return '사실과 다름';
+  }
+  if (/사실과\s*일치|일치함|맞습니다/.test(text)) {
+    return '사실과 일치';
+  }
+  return '확인 불가';
+}
+
+function normalizeOpinionVerdict(raw?: string): OpinionClaimVerdict {
+  const text = (raw || '').replace(/\s+/g, ' ').trim();
+  if (/비슷한\s*평가를\s*찾지\s*못함|찾지\s*못|엇갈|상반/.test(text)) {
+    return '비슷한 평가를 찾지 못함';
+  }
+  if (/다른\s*리뷰|비슷한\s*평가가\s*있음|비슷한\s*의견/.test(text)) {
+    return '다른 리뷰·기사에도 비슷한 평가가 있음';
+  }
+  return '확인 불가';
+}
+
+function parseSourceDateList(rawDateLine?: string): Array<string | undefined> {
+  if (!rawDateLine) return [];
+  const parts = rawDateLine
+    .split(/[|,\n]/)
+    .map((part) => part.replace(/^출처\s*\d*\s*[:：-]?\s*/i, '').trim())
+    .filter(Boolean);
+  return parts.map((part) => normalizePublishedDate(part));
+}
+
+function parseStructuredClaimBlock(
+  blockText: string,
+  claimType: ClaimType,
+  hasSources: boolean
+): {
+  status: FactCheckStatus;
+  verdict: ClaimFactCheckVerdict;
+  summary: string;
+  sourceDates: Array<string | undefined>;
+} {
+  const cleanedRaw = blockText
+    .replace(/\*\*/g, '')
+    .replace(/^#+\s*/gm, '')
+    .trim();
+
+  const verdictMatch = cleanedRaw.match(/(?:^|\n)\s*판정\s*[:：]\s*(.+)/);
+  const reasonMatch = cleanedRaw.match(/(?:^|\n)\s*이유\s*[:：]\s*(.+)/);
+  const dateMatch = cleanedRaw.match(/(?:^|\n)\s*출처날짜\s*[:：]\s*(.+)/);
+
+  const rawVerdict = verdictMatch?.[1]?.trim() || '';
+  const rawReason = (reasonMatch?.[1] || cleanedRaw)
+    .replace(/(?:^|\n)\s*(?:판정|출처날짜|유형)\s*[:：].*/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const sourceDates = parseSourceDateList(dateMatch?.[1]);
+
+  if (!hasSources || !cleanedRaw || NOT_FOUND_PATTERNS.some((pat) => pat.test(rawReason))) {
+    return {
+      status: 'not_found',
+      verdict: '확인 불가',
+      summary: '확인된 자료 없음',
+      sourceDates: [],
+    };
+  }
+
+  const verdict: ClaimFactCheckVerdict =
+    claimType === 'opinion'
+      ? normalizeOpinionVerdict(rawVerdict || rawReason)
+      : normalizeFactVerdict(rawVerdict || rawReason);
+
+  const summary = rawReason || '검색된 출처 내용을 확인해 주세요.';
+  return {
+    status: 'sources_found',
+    verdict,
+    summary,
+    sourceDates,
+  };
+}
+
+export function determineOverallFactCheckVerdict(
+  items: ClaimFactCheck[]
+): OverallFactCheckVerdict {
+  if (items.some((item) => item.verdict === '사실과 다름')) {
+    return '사실과 다른 내용이 있어요';
+  }
+
+  const factItems = items.filter((item) => item.claimType !== 'opinion');
+  if (
+    factItems.length > 0 &&
+    factItems.every(
+      (item) => item.status === 'sources_found' && item.verdict === '사실과 일치'
+    )
+  ) {
+    return '확인된 자료와 일치해요';
+  }
+
+  return '일부 내용은 확인되지 않았어요';
+}
+
 export function buildFactCheckReport(
   checkedItems: ClaimFactCheck[],
   remainingClaims: CoreClaim[]
 ): FactCheckReport {
   const verifiedCount = checkedItems.filter((item) => item.status === 'sources_found').length;
   const notFoundCount = checkedItems.filter((item) => item.status === 'not_found').length;
+  const searchErrorCount = checkedItems.filter((item) => item.status === 'search_error').length;
+  const overallVerdict = determineOverallFactCheckVerdict(checkedItems);
 
   return {
     checkedCount: checkedItems.length,
     verifiedCount,
     notFoundCount,
+    searchErrorCount,
+    overallVerdict,
     items: checkedItems,
     uncheckedClaims: remainingClaims,
   };
@@ -170,7 +462,8 @@ export interface GroundingMetadataInput {
 export function parseMultiClaimFactCheckResponse(
   claims: CoreClaim[],
   responseText: string,
-  groundingMeta?: GroundingMetadataInput
+  groundingMeta?: GroundingMetadataInput,
+  now: Date = new Date()
 ): ClaimFactCheck[] {
   const allChunks = Array.isArray(groundingMeta?.groundingChunks)
     ? groundingMeta.groundingChunks
@@ -186,6 +479,7 @@ export function parseMultiClaimFactCheckResponse(
 
   return claims.map((claimItem, idx) => {
     const num = idx + 1;
+    const claimType: ClaimType = claimItem.claimType === 'opinion' ? 'opinion' : 'fact';
     const tagRegex = new RegExp(
       `\\[CLAIM\\s*${num}\\]([\\s\\S]*?)\\[\\/CLAIM\\s*${num}\\]`,
       'i'
@@ -206,20 +500,25 @@ export function parseMultiClaimFactCheckResponse(
       blockEnd = text.length;
     }
 
-    // Match groundingChunks attributed to this claim's text span via groundingSupports
+    // Match groundingChunks attributed to this claim's text span via groundingSupports.
+    // Gemini returns segment.startIndex/endIndex in UTF-8 bytes; convert them to JS UTF-16 char indices.
     let matchedIndices: number[] = [];
     if (blockStart >= 0 && supports.length > 0) {
       const indexSet = new Set<number>();
       for (const support of supports) {
-        const segStart = support?.segment?.startIndex;
-        const segEnd = support?.segment?.endIndex;
+        const segStartBytes = support?.segment?.startIndex;
+        const segEndBytes = support?.segment?.endIndex;
         const segText = support?.segment?.text?.trim();
 
-        const overlapsBySpan =
-          typeof segStart === 'number' &&
-          typeof segEnd === 'number' &&
-          segEnd > blockStart &&
-          segStart < blockEnd;
+        let overlapsBySpan = false;
+        if (typeof segStartBytes === 'number' && typeof segEndBytes === 'number') {
+          const { start: charStart, end: charEnd } = utf8ByteRangeToCharRange(
+            text,
+            segStartBytes,
+            segEndBytes
+          );
+          overlapsBySpan = charEnd > blockStart && charStart < blockEnd;
+        }
         const overlapsByText = Boolean(segText && blockText.includes(segText));
 
         if ((overlapsBySpan || overlapsByText) && Array.isArray(support.groundingChunkIndices)) {
@@ -240,13 +539,26 @@ export function parseMultiClaimFactCheckResponse(
           ? allChunks
           : [];
 
-    const sources = extractGroundingWebSources(scopedChunks);
-    const { status, summary } = sanitizeNonJudgmentalFactSummary(blockText, sources.length > 0);
+    const preliminaryParsed = parseStructuredClaimBlock(blockText, claimType, scopedChunks.length > 0);
+    const sources = extractGroundingWebSources(
+      scopedChunks,
+      5,
+      preliminaryParsed.sourceDates,
+      now
+    );
+
+    const { status, verdict, summary } = parseStructuredClaimBlock(
+      blockText,
+      claimType,
+      sources.length > 0
+    );
 
     return {
       claimId: claimItem.id,
       claim: claimItem.claim,
+      claimType,
       status,
+      verdict,
       summary,
       sources: status === 'sources_found' ? sources : [],
       searchQueries: allSearchQueries,

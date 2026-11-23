@@ -14,7 +14,12 @@ import {
   ShieldAlert,
   ShieldCheck,
 } from 'lucide-react';
-import type { AiSuspicionReport, AnalysisReport } from '../types/analysis';
+import type {
+  AiSuspicionReport,
+  AnalysisReport,
+  ClaimFactCheckVerdict,
+  OverallFactCheckVerdict,
+} from '../types/analysis';
 import {
   buildSearchUrl,
   calculateChecklistProgress,
@@ -24,7 +29,9 @@ import {
   getOverallStatusMeta,
 } from '../utils/analysisHelpers';
 import { calculateAiSuspicionScore, getAiSuspicionMeta } from '../utils/aiSuspicion';
+import { determineOverallFactCheckVerdict } from '../utils/factCheck';
 import { getPlatformLabel } from '../utils/urlParser';
+import { formatFileSizeLabel } from '../utils/videoUpload';
 
 interface AnalysisReportViewProps {
   report: AnalysisReport;
@@ -39,6 +46,49 @@ const CORE_ITEM_SHORT_LABELS: Record<string, string> = {
   'chk-exaggeration': '4. 차분한 표현',
   'chk-cross-check': '5. 균형 있는 설명',
 };
+
+function getOverallFactCheckBannerMeta(verdict: OverallFactCheckVerdict) {
+  switch (verdict) {
+    case '사실과 다른 내용이 있어요':
+      return {
+        containerClass: 'border-rose-300 bg-rose-50 text-rose-950',
+        iconClass: 'text-rose-700',
+        labelClass: 'text-rose-800',
+        Icon: ShieldAlert,
+      };
+    case '확인된 자료와 일치해요':
+      return {
+        containerClass: 'border-emerald-300 bg-emerald-50 text-emerald-950',
+        iconClass: 'text-emerald-700',
+        labelClass: 'text-emerald-800',
+        Icon: ShieldCheck,
+      };
+    case '일부 내용은 확인되지 않았어요':
+    default:
+      return {
+        containerClass: 'border-amber-300 bg-amber-50 text-amber-950',
+        iconClass: 'text-amber-700',
+        labelClass: 'text-amber-800',
+        Icon: AlertTriangle,
+      };
+  }
+}
+
+function getClaimVerdictBadgeClass(verdict?: ClaimFactCheckVerdict): string {
+  switch (verdict) {
+    case '사실과 일치':
+      return 'border-emerald-300 bg-emerald-100 text-emerald-950';
+    case '사실과 다름':
+      return 'border-rose-300 bg-rose-100 text-rose-950';
+    case '다른 리뷰·기사에도 비슷한 평가가 있음':
+      return 'border-blue-300 bg-blue-100 text-blue-950';
+    case '비슷한 평가를 찾지 못함':
+      return 'border-amber-300 bg-amber-100 text-amber-950';
+    case '확인 불가':
+    default:
+      return 'border-slate-300 bg-white text-slate-700';
+  }
+}
 
 export const AnalysisReportView: React.FC<AnalysisReportViewProps> = ({
   report,
@@ -151,6 +201,12 @@ export const AnalysisReportView: React.FC<AnalysisReportViewProps> = ({
                 ? `AI 의심 ${aiSuspicion.score}점 / 100점`
                 : 'AI 의심 판별 불가'}
             </span>
+            {report.elapsedSeconds != null && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span data-testid="report-elapsed-seconds">{report.elapsedSeconds}초 소요</span>
+              </>
+            )}
           </div>
           <h1 className="mt-1.5 text-2xl font-bold tracking-tight text-slate-950 sm:text-3xl">
             {report.contentTitle}
@@ -178,6 +234,51 @@ export const AnalysisReportView: React.FC<AnalysisReportViewProps> = ({
           </button>
         </div>
       </div>
+
+      {/* 0. 결과 화면 맨 위: 종합 사실 확인 판정 배너 */}
+      {report.factCheck && (() => {
+        const resolvedOverallVerdict =
+          report.factCheck.overallVerdict ??
+          determineOverallFactCheckVerdict(report.factCheck.items);
+        const bannerMeta = getOverallFactCheckBannerMeta(resolvedOverallVerdict);
+        const BannerIcon = bannerMeta.Icon;
+        const factCount = report.factCheck.items.filter(
+          (item) => item.claimType !== 'opinion'
+        ).length;
+        const opinionCount = report.factCheck.items.filter(
+          (item) => item.claimType === 'opinion'
+        ).length;
+        const errorCount = report.factCheck.searchErrorCount ?? 0;
+
+        return (
+          <section
+            data-testid="overall-fact-check-verdict"
+            aria-label="종합 사실 확인 판정"
+            className={`rounded-2xl border-2 p-5 sm:p-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between ${bannerMeta.containerClass}`}
+          >
+            <div className="flex items-start gap-3.5">
+              <BannerIcon
+                className={`h-7 w-7 shrink-0 mt-0.5 ${bannerMeta.iconClass}`}
+                aria-hidden="true"
+              />
+              <div className="space-y-1">
+                <p className={`text-xs font-bold ${bannerMeta.labelClass}`}>
+                  최신 검색 자료 기준 종합 판정
+                </p>
+                <p className="text-xl font-extrabold tracking-tight sm:text-2xl">
+                  {resolvedOverallVerdict}
+                </p>
+              </div>
+            </div>
+            <div className="text-xs font-medium opacity-85 sm:text-right space-y-0.5 pl-10 sm:pl-0 font-mono tabular-nums">
+              <p>
+                사실 주장 {factCount}개 · 의견 주장 {opinionCount}개 확인
+              </p>
+              {errorCount > 0 && <p>검색 오류 {errorCount}개 발생</p>}
+            </div>
+          </section>
+        );
+      })()}
 
       {/* 제작자 AI 합성 콘텐츠 표시 (YouTube Data API containsSyntheticMedia === true 일 때만 최상단 표시) */}
       {aiSuspicion.creatorDisclosedSyntheticMedia && (
@@ -499,6 +600,22 @@ export const AnalysisReportView: React.FC<AnalysisReportViewProps> = ({
                 <span>SynthID Detector(https://synthid.com)에서 원본 파일로 추가 확인하기</span>
                 <ExternalLink className="h-4 w-4 shrink-0 text-slate-500" aria-hidden="true" />
               </a>
+
+              {aiSuspicion.youtubeCreatorCheckStatus && (
+                <p
+                  data-testid="youtube-creator-check-status"
+                  className="flex items-center justify-between gap-2 px-1 pt-0.5 text-[11px] text-slate-500"
+                >
+                  <span>YouTube 제작자 표시 확인</span>
+                  <span className="font-medium text-slate-700">
+                    {aiSuspicion.youtubeCreatorCheckStatus === 'checked'
+                      ? '확인함'
+                      : aiSuspicion.youtubeCreatorCheckStatus === 'no_api_key'
+                        ? '키 없음(건너뜀)'
+                        : '조회 실패'}
+                  </span>
+                </p>
+              )}
             </div>
           </div>
         </section>
@@ -507,10 +624,20 @@ export const AnalysisReportView: React.FC<AnalysisReportViewProps> = ({
       {/* 2. 점수 아래: 3줄 요약 카드 */}
       <section aria-labelledby="three-line-summary-heading">
         <div className="rounded-2xl border border-slate-200 bg-white p-5 space-y-3.5">
-          <div className="flex items-center justify-between gap-4 border-b border-slate-100 pb-3.5">
-            <h2 id="three-line-summary-heading" className="text-lg font-bold text-slate-950">
-              한눈에 보는 3줄 요약
-            </h2>
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 pb-3.5">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <h2 id="three-line-summary-heading" className="text-lg font-bold text-slate-950">
+                한눈에 보는 3줄 요약
+              </h2>
+              {report.reorganizedByLatestSearch && (
+                <span
+                  data-testid="latest-search-reorganized-badge"
+                  className="inline-flex items-center rounded-md border border-blue-200 bg-blue-50 px-2.5 py-0.5 text-xs font-semibold text-blue-900"
+                >
+                  최신 검색 자료를 기준으로 다시 정리했어요
+                </span>
+              )}
+            </div>
             {videoInfo?.thumbnailUrl && (
               <span className="text-xs text-slate-500 truncate max-w-xs">
                 {videoInfo.title || report.contentTitle}
@@ -550,6 +677,9 @@ export const AnalysisReportView: React.FC<AnalysisReportViewProps> = ({
         const notFoundItems = (factCheck?.items ?? []).filter(
           (item) => item.status === 'not_found'
         );
+        const searchErrorItems = (factCheck?.items ?? []).filter(
+          (item) => item.status === 'search_error'
+        );
         const uncheckedClaims = factCheck?.uncheckedClaims ?? [];
         const unverifiedTotal = notFoundItems.length + uncheckedClaims.length;
 
@@ -559,21 +689,26 @@ export const AnalysisReportView: React.FC<AnalysisReportViewProps> = ({
               <div className="flex flex-col gap-2 border-b border-slate-100 pb-3.5 sm:flex-row sm:items-center sm:justify-between">
                 <div>
                   <h2 id="fact-check-heading" className="text-lg font-bold text-slate-950">
-                    핵심 주장 Google 검색 자료 확인 (최대 3개)
+                    핵심 주장 Google 검색 판정 (사실 주장 우선 · 최대 3개)
                   </h2>
                   <p className="mt-0.5 text-xs text-slate-500">
-                    추출된 핵심 주장을 Google 검색으로 대조해 확인된 자료와 출처 링크를 정리했어요.
-                    참·거짓을 단정하지 않으며 참고 자료로 제공합니다.
+                    사실 주장을 우선 선별해 제품명·사건명과 올해 연도로 최신 자료를 검색해 판정했어요.
+                    출처마다 작성·수정 날짜를 함께 보여 드립니다.
                   </p>
                 </div>
                 {factCheck && factCheck.checkedCount > 0 && (
                   <div className="flex flex-wrap items-center gap-2 text-xs font-mono tabular-nums shrink-0">
                     <span className="rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1 font-semibold text-emerald-900">
-                      검색으로 확인한 주장 {verifiedItems.length}개
+                      자료 확인 {verifiedItems.length}개
                     </span>
                     <span className="rounded-md border border-slate-200 bg-slate-100 px-2.5 py-1 font-semibold text-slate-700">
-                      확인하지 못한 주장 {unverifiedTotal}개
+                      확인 불가 {unverifiedTotal}개
                     </span>
+                    {searchErrorItems.length > 0 && (
+                      <span className="rounded-md border border-rose-200 bg-rose-50 px-2.5 py-1 font-semibold text-rose-900">
+                        검색 오류 {searchErrorItems.length}개
+                      </span>
+                    )}
                   </div>
                 )}
               </div>
@@ -590,39 +725,119 @@ export const AnalysisReportView: React.FC<AnalysisReportViewProps> = ({
                 <div className="space-y-5">
                   {verifiedItems.length > 0 && (
                     <div className="space-y-3">
-                      <h3 className="text-xs font-bold text-emerald-900">
-                        검색으로 자료를 확인한 주장 ({verifiedItems.length}개)
+                      <h3 className="text-xs font-bold text-slate-800">
+                        검색 자료를 바탕으로 판정한 주장 ({verifiedItems.length}개)
                       </h3>
                       <div className="space-y-3">
-                        {verifiedItems.map((item) => (
+                        {verifiedItems.map((item) => {
+                          const isOpinion = item.claimType === 'opinion';
+                          const verdictLabel = item.verdict || '확인 불가';
+                          const cardBorder =
+                            verdictLabel === '사실과 다름'
+                              ? 'border-rose-200 bg-rose-50/40'
+                              : verdictLabel === '사실과 일치'
+                                ? 'border-emerald-200 bg-emerald-50/40'
+                                : 'border-slate-200 bg-slate-50/60';
+
+                          return (
+                            <article
+                              key={item.claimId}
+                              data-testid="fact-check-claim-card"
+                              className={`rounded-xl border p-4 space-y-2.5 ${cardBorder}`}
+                            >
+                              <div className="flex flex-wrap items-start justify-between gap-2">
+                                <div className="flex flex-wrap items-center gap-2 min-w-0">
+                                  <span
+                                    className={`rounded-md border px-2 py-0.5 text-[11px] font-bold shrink-0 ${
+                                      isOpinion
+                                        ? 'border-indigo-200 bg-indigo-50 text-indigo-900'
+                                        : 'border-blue-200 bg-blue-50 text-blue-900'
+                                    }`}
+                                  >
+                                    {isOpinion ? '의견 주장' : '사실 주장'}
+                                  </span>
+                                  <p className="text-sm font-bold text-slate-950">{item.claim}</p>
+                                </div>
+                                <span
+                                  data-testid="claim-verdict-badge"
+                                  className={`rounded-md border px-2.5 py-0.5 text-xs font-bold shrink-0 ${getClaimVerdictBadgeClass(
+                                    item.verdict
+                                  )}`}
+                                >
+                                  {verdictLabel}
+                                </span>
+                              </div>
+
+                              <p className="text-sm leading-relaxed text-slate-800">{item.summary}</p>
+
+                              {item.sources.length > 0 && (
+                                <div className="space-y-1.5 pt-1">
+                                  <p className="text-xs font-semibold text-slate-700">
+                                    출처 링크 및 작성 날짜
+                                  </p>
+                                  <div className="flex flex-wrap gap-2">
+                                    {item.sources.map((src, idx) => (
+                                      <a
+                                        key={idx}
+                                        href={src.url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-blue-800 transition-colors hover:border-blue-300 hover:bg-blue-50"
+                                      >
+                                        <span className="max-w-[160px] sm:max-w-[220px] truncate">{src.title}</span>
+                                        <span className="font-mono text-[11px] text-slate-500 tabular-nums shrink-0">
+                                          · {src.publishedDate || '날짜 미상'}
+                                        </span>
+                                        {src.isOutdated && (
+                                          <span
+                                            data-testid="outdated-source-badge"
+                                            className="rounded border border-amber-300 bg-amber-50 px-1.5 py-0.5 text-[10px] font-bold text-amber-900 shrink-0"
+                                          >
+                                            오래된 자료
+                                          </span>
+                                        )}
+                                        <ExternalLink
+                                          className="h-3 w-3 shrink-0"
+                                          aria-hidden="true"
+                                        />
+                                      </a>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                            </article>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {searchErrorItems.length > 0 && (
+                    <div className="space-y-3">
+                      <h3 className="text-xs font-bold text-rose-900">
+                        검색 중 오류가 발생한 주장 ({searchErrorItems.length}개)
+                      </h3>
+                      <div className="space-y-2.5">
+                        {searchErrorItems.map((item) => (
                           <article
                             key={item.claimId}
-                            className="rounded-xl border border-emerald-200 bg-emerald-50/40 p-4 space-y-2.5"
+                            data-testid="fact-check-search-error-card"
+                            className="rounded-xl border border-rose-200 bg-rose-50/70 p-4 space-y-1.5"
                           >
-                            <p className="text-sm font-bold text-slate-950">{item.claim}</p>
-                            <p className="text-sm leading-relaxed text-slate-800">{item.summary}</p>
-                            {item.sources.length > 0 && (
-                              <div className="space-y-1.5 pt-1">
-                                <p className="text-xs font-semibold text-slate-700">출처 링크</p>
-                                <div className="flex flex-wrap gap-2">
-                                  {item.sources.map((src, idx) => (
-                                    <a
-                                      key={idx}
-                                      href={src.url}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-blue-800 transition-colors hover:border-blue-300 hover:bg-blue-50"
-                                    >
-                                      <span className="max-w-[240px] truncate">{src.title}</span>
-                                      <ExternalLink
-                                        className="h-3 w-3 shrink-0"
-                                        aria-hidden="true"
-                                      />
-                                    </a>
-                                  ))}
-                                </div>
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <div className="flex flex-wrap items-center gap-2 min-w-0">
+                                <span className="rounded-md border border-blue-200 bg-white px-2 py-0.5 text-[11px] font-bold text-blue-900 shrink-0">
+                                  {item.claimType === 'opinion' ? '의견 주장' : '사실 주장'}
+                                </span>
+                                <p className="text-sm font-semibold text-slate-950">{item.claim}</p>
                               </div>
-                            )}
+                              <span className="rounded-md border border-rose-300 bg-white px-2.5 py-0.5 text-xs font-bold text-rose-900 shrink-0">
+                                검색 중 오류가 났어요
+                              </span>
+                            </div>
+                            <p className="text-xs text-rose-900">
+                              Google 검색 요청 중 일시적인 오류가 발생해 판정하지 못했어요. 잠시 후 다시 시도하거나 아래 추천 검색어로 직접 확인해 주세요.
+                            </p>
                           </article>
                         ))}
                       </div>
@@ -632,7 +847,7 @@ export const AnalysisReportView: React.FC<AnalysisReportViewProps> = ({
                   {unverifiedTotal > 0 && (
                     <div className="space-y-3">
                       <h3 className="text-xs font-bold text-slate-700">
-                        검색으로 자료를 확인하지 못한 주장 ({unverifiedTotal}개)
+                        자료를 찾지 못했거나 확인되지 않은 주장 ({unverifiedTotal}개)
                       </h3>
                       <div className="space-y-2.5">
                         {notFoundItems.map((item) => (
@@ -641,33 +856,41 @@ export const AnalysisReportView: React.FC<AnalysisReportViewProps> = ({
                             className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-1.5"
                           >
                             <div className="flex flex-wrap items-center justify-between gap-2">
-                              <p className="text-sm font-semibold text-slate-900">{item.claim}</p>
-                              <span className="rounded-md border border-slate-300 bg-white px-2.5 py-0.5 text-xs font-semibold text-slate-700">
-                                확인된 자료 없음
+                              <div className="flex flex-wrap items-center gap-2 min-w-0">
+                                <span className="rounded-md border border-slate-300 bg-white px-2 py-0.5 text-[11px] font-bold text-slate-700 shrink-0">
+                                  {item.claimType === 'opinion' ? '의견 주장' : '사실 주장'}
+                                </span>
+                                <p className="text-sm font-semibold text-slate-900">{item.claim}</p>
+                              </div>
+                              <span className="rounded-md border border-slate-300 bg-white px-2.5 py-0.5 text-xs font-bold text-slate-700 shrink-0">
+                                {item.verdict || '확인 불가'}
                               </span>
                             </div>
                             <p className="text-xs text-slate-600">
-                              Google 검색에서 이 주장을 뒷받침하거나 확인할 수 있는 공식 자료를 찾지
-                              못했어요.
+                              확인된 자료 없음 — Google 검색에서 이 주장을 대조할 신뢰할 만한 자료를 찾지 못했어요.
                             </p>
                           </article>
                         ))}
-                        {uncheckedClaims.map((claimItem) => (
+                        {uncheckedClaims.map((claimItem, idx) => (
                           <article
-                            key={claimItem.id}
+                            key={claimItem.id || `unchecked-${idx}`}
                             className="rounded-xl border border-slate-200 bg-slate-50 p-4 space-y-1.5"
                           >
                             <div className="flex flex-wrap items-center justify-between gap-2">
-                              <p className="text-sm font-semibold text-slate-900">
-                                {claimItem.claim}
-                              </p>
-                              <span className="rounded-md border border-slate-300 bg-white px-2.5 py-0.5 text-xs font-semibold text-slate-600">
-                                검색 대상 외 (상위 3개 우선 확인)
+                              <div className="flex flex-wrap items-center gap-2 min-w-0">
+                                <span className="rounded-md border border-slate-300 bg-white px-2 py-0.5 text-[11px] font-bold text-slate-700 shrink-0">
+                                  {claimItem.claimType === 'opinion' ? '의견 주장' : '사실 주장'}
+                                </span>
+                                <p className="text-sm font-semibold text-slate-900">
+                                  {claimItem.claim}
+                                </p>
+                              </div>
+                              <span className="rounded-md border border-slate-300 bg-white px-2.5 py-0.5 text-xs font-semibold text-slate-600 shrink-0">
+                                검색 대상 외 (사실 주장 우선 · 최대 3개)
                               </span>
                             </div>
                             <p className="text-xs text-slate-600">
-                              핵심 주장 상위 3개만 자동 검색으로 확인했어요. 아래 추천 검색어로 직접
-                              확인해 보세요.
+                              사실 주장을 우선으로 상위 3개만 자동 검색으로 확인했어요. 아래 추천 검색어로 직접 확인해 보세요.
                             </p>
                           </article>
                         ))}
@@ -731,24 +954,51 @@ export const AnalysisReportView: React.FC<AnalysisReportViewProps> = ({
                   />
                 )}
                 <div className="min-w-0 flex-1 space-y-2">
-                  {(videoInfo?.title || videoInfo?.author || videoInfo?.uploadedFileName) && (
+                  {(videoInfo?.title ||
+                    videoInfo?.author ||
+                    videoInfo?.uploadedFileName ||
+                    report.compressionSummary?.wasCompressed) && (
                     <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600">
-                      {videoInfo.title && (
+                      {videoInfo?.title && (
                         <span className="font-semibold text-slate-950 text-sm">
                           {videoInfo.title}
                         </span>
                       )}
-                      {videoInfo.author && (
+                      {videoInfo?.author && (
                         <>
                           <span aria-hidden="true">·</span>
                           <span>채널/작성자: {videoInfo.author}</span>
                         </>
                       )}
-                      {videoInfo.uploadedFileName && (
+                      {videoInfo?.uploadedFileName && (
                         <>
                           <span aria-hidden="true">·</span>
                           <span className="font-mono">업로드 영상: {videoInfo.uploadedFileName}</span>
                         </>
+                      )}
+                      {report.compressionSummary?.wasCompressed && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span className="font-mono tabular-nums">
+                            원본 {formatFileSizeLabel(report.compressionSummary.originalSizeBytes)} →{' '}
+                            {formatFileSizeLabel(report.compressionSummary.compressedSizeBytes)}
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  )}
+
+                  {report.c2paMetadata?.hasManifest && (
+                    <div className="rounded-lg border border-blue-200 bg-blue-50/70 px-3 py-2 text-xs text-blue-950">
+                      <span className="font-semibold">원본 C2PA 출처 자격 증명 확인됨</span>
+                      {report.c2paMetadata.claimGenerator && (
+                        <span> · 생성 도구: {report.c2paMetadata.claimGenerator}</span>
+                      )}
+                      {report.c2paMetadata.issuer && (
+                        <span> · 서명 발급: {report.c2paMetadata.issuer}</span>
+                      )}
+                      {report.c2paMetadata.isAiGeneratedClaim && (
+                        <span className="font-semibold text-amber-900"> · AI 생성/합성 표기 포함</span>
                       )}
                     </div>
                   )}
@@ -758,10 +1008,17 @@ export const AnalysisReportView: React.FC<AnalysisReportViewProps> = ({
                   </p>
 
                   {report.overallSummary && (
-                    <p className="text-sm leading-relaxed text-slate-600 pt-1">
-                      <span className="font-semibold text-slate-800">전체 설명: </span>
-                      {report.overallSummary}
-                    </p>
+                    <div className="space-y-1.5 pt-1">
+                      {report.reorganizedByLatestSearch && (
+                        <p className="text-xs font-semibold text-blue-800">
+                          최신 검색 자료를 기준으로 다시 정리했어요
+                        </p>
+                      )}
+                      <p className="text-sm leading-relaxed text-slate-600">
+                        <span className="font-semibold text-slate-800">전체 설명: </span>
+                        {report.overallSummary}
+                      </p>
+                    </div>
                   )}
 
                   {report.extractedImageText && (
@@ -855,9 +1112,18 @@ export const AnalysisReportView: React.FC<AnalysisReportViewProps> = ({
                 <div className="divide-y divide-slate-100">
                   {report.coreClaims.map((claim, index) => (
                     <article key={claim.id} className="py-4 first:pt-0 last:pb-0 space-y-2.5">
-                      <div className="flex items-baseline gap-3">
+                      <div className="flex flex-wrap items-baseline gap-2.5">
                         <span className="font-mono text-xs font-semibold text-blue-700 tabular-nums shrink-0">
                           주장 {String(index + 1).padStart(2, '0')}
+                        </span>
+                        <span
+                          className={`rounded border px-1.5 py-0.5 text-[11px] font-semibold shrink-0 ${
+                            claim.claimType === 'opinion'
+                              ? 'border-indigo-200 bg-indigo-50 text-indigo-900'
+                              : 'border-blue-200 bg-blue-50 text-blue-900'
+                          }`}
+                        >
+                          {claim.claimType === 'opinion' ? '의견 주장' : '사실 주장'}
                         </span>
                         <h3 className="text-base font-semibold text-slate-950 leading-snug">
                           {claim.claim}

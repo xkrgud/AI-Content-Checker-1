@@ -12,6 +12,7 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
+    "@contentauth/c2pa-web": "^0.17.1",
     "@google/genai": "^3.6.1",
     "@tailwindcss/vite": "^4.3.3",
     "@types/multer": "^2.3.0",
@@ -19,6 +20,7 @@
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "lucide-react": "^0.546.0",
+    "mediabunny": "^1.66.2",
     "motion": "^12.23.24",
     "multer": "^2.5.0",
     "react": "^19.0.1",
